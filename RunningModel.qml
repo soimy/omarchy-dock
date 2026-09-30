@@ -34,9 +34,9 @@ Item {
   // watchers below so the group binding re-evaluates.
   property int rev: 0
 
-  // Most-recently-used order, newest first, as toplevel references. Never
-  // pruned — closed windows just stop appearing in the live list this is
-  // intersected with.
+  // Most-recently-used order, newest first, as toplevel references. Closed
+  // windows are dropped on the next focus change — the dock stays loaded for
+  // the whole session, so an unpruned list only ever grows.
   property var mru: []
 
   Connections {
@@ -44,9 +44,12 @@ Item {
     function onActiveToplevelChanged() {
       var t = ToplevelManager.activeToplevel
       if (!t) return
+      var live = ToplevelManager.toplevels.values || []
       var next = [t]
-      for (var i = 0; i < model.mru.length; i++)
-        if (model.mru[i] !== t) next.push(model.mru[i])
+      for (var i = 0; i < model.mru.length; i++) {
+        var w = model.mru[i]
+        if (w && w !== t && live.indexOf(w) >= 0) next.push(w)
+      }
       model.mru = next
     }
   }

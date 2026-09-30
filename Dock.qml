@@ -138,7 +138,23 @@ Item {
 
   // ------------------------------------------------------------- geometry
 
-  readonly property var items: Array.isArray(config.items) ? config.items : []
+  // items[] from the config, with a stable identity. The shell rewrites
+  // shell.json for every setting anywhere in the shell, and each rewrite
+  // parses into brand-new objects; adopting those would rebuild every dock
+  // cell (dropping hover, magnify, and any open popup) for a change that
+  // wasn't ours. Only a real change to the list replaces it.
+  readonly property var configItems: Array.isArray(config.items) ? config.items : []
+  property var items: []
+  property string itemsKey: ""
+  onConfigItemsChanged: syncItems()
+  Component.onCompleted: { syncItems(); adoptDisplay() }
+
+  function syncItems() {
+    var key = JSON.stringify(configItems)
+    if (key === itemsKey) return
+    itemsKey = key
+    items = configItems
+  }
 
   // ------------------------------------------------------------- position
   //
@@ -305,6 +321,10 @@ Item {
   function unregisterCell(cell) {
     var i = cells.indexOf(cell)
     if (i >= 0) cells.splice(i, 1)
+    // A popup anchored to a cell that just went away (the dock rebuilt
+    // under it) would keep a dangling anchor and a stale item; fold it.
+    if (contextMenu.anchorCell === cell) contextMenu.close()
+    if (windowStack.anchorCell === cell) windowStack.close()
   }
 
   function cellAt(index) {
@@ -341,7 +361,7 @@ Item {
   // What the dock actually renders: the pinned items, then — while anything
   // unpinned is running — a divider and the running section. The divider is
   // derived exactly like the section is; neither is ever saved.
-  readonly property var displayItems: {
+  readonly property var displayFresh: {
     var out = shownItems.slice()
     if (showRunning) {
       var ex = running.extras
@@ -352,6 +372,47 @@ Item {
     }
     return out
   }
+
+  // The Repeater's model. A JS-array model is rebuilt wholesale whenever the
+  // array is replaced, so a new array is only adopted when the rendered
+  // content actually differs. Pinned items compare by identity (items[] is
+  // already stable, see syncItems); the divider and running-section items
+  // are rebuilt on every window event, so they compare by what they show.
+  property var displayItems: []
+  onDisplayFreshChanged: adoptDisplay()
+
+  function displayKey(it) {
+    if (!Util.isPlainObject(it)) return null
+    if (it.__divider === true) return "|"
+    if (it.__running !== true) return null
+    return "r\u0001" + it.appId + "\u0001" + (it.label || "") + "\u0001" + (it.glyph || "")
+      + "\u0001" + (it.__entry ? String(it.__entry.id || "") : "")
+  }
+
+  function adoptDisplay() {
+    var fresh = displayFresh
+    var old = displayItems
+    var same = fresh.length === old.length
+    var out = new Array(fresh.length)
+    for (var i = 0; i < fresh.length; i++) {
+      var f = fresh[i]
+      var o = i < old.length ? old[i] : undefined
+      var k = displayKey(f)
+      if (f === o || (k !== null && o !== undefined && displayKey(o) === k)) {
+        out[i] = o
+      } else {
+        out[i] = f
+        same = false
+      }
+    }
+    if (!same) {
+      displayItems = out
+      displayRev++
+    }
+  }
+  // How many times the cells have been rebuilt; in `state`, for checking
+  // that unrelated config or window churn leaves them alone.
+  property int displayRev: 0
 
   // ----------------------------------------------------------------- drag
   //
@@ -528,12 +589,21 @@ Item {
 
   function evaluateConditions() {
     if (conditionIndices.length === 0) return
+    // One run at a time. A request that lands mid-run is queued rather
+    // than dropped, and the results are mapped back through the indices
+    // the run was started with — the item list may have moved since.
+    if (conditionProc.running) {
+      conditionProc.again = true
+      return
+    }
     var lines = []
     for (var i = 0; i < conditionIndices.length; i++) {
       var cmd = String(items[conditionIndices[i]].when)
       // Each condition is wrapped so its own exit status is all that escapes.
       lines.push("if { " + cmd + " ; } >/dev/null 2>&1; then echo 1; else echo 0; fi")
     }
+    conditionProc.indices = conditionIndices.slice()
+    conditionProc.pending = []
     conditionProc.command = ["bash", "-lc", lines.join("\n")]
     conditionProc.running = true
   }
@@ -543,8 +613,8 @@ Item {
   Process {
     id: conditionProc
     property var pending: []
-
-    onRunningChanged: if (running) pending = []
+    property var indices: []
+    property bool again: false
 
     stdout: SplitParser {
       onRead: function(line) {
@@ -554,19 +624,23 @@ Item {
 
     onExited: {
       var next = ({})
-      for (var i = 0; i < root.conditionIndices.length; i++) {
+      for (var i = 0; i < conditionProc.indices.length; i++) {
         var v = conditionProc.pending[i]
-        if (v !== undefined) next[root.conditionIndices[i]] = v
+        if (v !== undefined) next[conditionProc.indices[i]] = v
       }
       root.conditionResults = next
+      if (conditionProc.again) {
+        conditionProc.again = false
+        Qt.callLater(root.evaluateConditions)
+      }
     }
   }
 
   // Cheap enough to poll: one bash invocation on a handful of conditions.
-  // Re-checked on reveal too, so an item is never stale by the time it is
-  // actually looked at.
+  // Only while a dock can be seen, though — a parked dock has nothing to
+  // keep fresh, and reveal re-checks before anything is looked at.
   Timer {
-    running: root.conditionIndices.length > 0
+    running: root.conditionIndices.length > 0 && (root.revealed || root.showWhenEmpty)
     interval: 5000
     repeat: true
     triggeredOnStart: true
@@ -993,13 +1067,48 @@ Item {
       return String(p.glyphView.length)
     }
 
+    // Switch the settings tab: "items" or "dock".
+    function settingsTab(tab: string): string {
+      var p = settingsLoader.item
+      if (!p || !p.opened) return "not open"
+      p.flush()
+      p.dockPage = String(tab) === "dock"
+      return "ok"
+    }
+
+    // Open the app picker, as the Add an app button does.
+    function settingsApps(query: string): string {
+      var p = settingsLoader.item
+      if (!p || !p.opened) return "not open"
+      p.openAppPicker("add")
+      p.appQuery = String(query)
+      return String(p.appView.length)
+    }
+
+    // Drive the write queue headlessly: a dock setting (JSON value, "null"
+    // resets), and moving the selected item by a signed step.
+    function settingsSet(key: string, value: string): string {
+      var p = settingsLoader.item
+      if (!p || !p.opened) return "not open"
+      p.setDock(String(key), JSON.parse(String(value)))
+      return "queued"
+    }
+
+    function settingsMove(delta: string): string {
+      var p = settingsLoader.item
+      if (!p || !p.opened) return "not open"
+      p.moveSelected(Math.round(Number(delta)))
+      return String(p.selIndex)
+    }
+
     function settingsState(): string {
       var p = settingsLoader.item
       if (!p) return "not loaded"
       return JSON.stringify({ opened: p.opened, sel: p.selIndex, dirty: p.dirty,
                               glyphs: p.glyphList.length, apps: p.appEntries.length,
                               picker: p.picker, glyphCat: p.glyphCat,
-                              glyphQuery: p.glyphQuery,
+                              glyphQuery: p.glyphQuery, queued: p.queue.length,
+                              writing: p.writerBusy, error: p.errorText,
                               glyphShown: p.picker === "glyphs" ? p.glyphView.length : 0 })
     }
 
@@ -1009,6 +1118,7 @@ Item {
         items: root.items.length,
         shown: root.shownItems.length,
         display: root.displayItems.length,
+        displayRev: root.displayRev,
         menuOpen: contextMenu.open,
         menuRows: contextMenu.rows.length,
         menuChoosing: contextMenu.choosing,
@@ -1073,16 +1183,24 @@ Item {
 
   // ------------------------------------------------------------ item model
 
+  // Desktop id -> entry. Built once per change to the installed apps rather
+  // than scanned per lookup: window matching asks for every item's entry on
+  // every focus change.
+  readonly property var entryIndex: {
+    var out = {}
+    var values = (DesktopEntries.applications && DesktopEntries.applications.values) || []
+    for (var i = 0; i < values.length; i++) {
+      var entry = values[i]
+      if (entry) out[String(entry.id || "").replace(/\.desktop$/, "")] = entry
+    }
+    return out
+  }
+
   function desktopEntry(item) {
     if (!Util.isPlainObject(item)) return null
     var want = String(item.desktop || "").replace(/\.desktop$/, "")
     if (!want) return null
-    var values = (DesktopEntries.applications && DesktopEntries.applications.values) || []
-    for (var i = 0; i < values.length; i++) {
-      var entry = values[i]
-      if (entry && String(entry.id || "").replace(/\.desktop$/, "") === want) return entry
-    }
-    return null
+    return entryIndex[want] || null
   }
 
   // The app's own name for the item — explicit `label`, else the entry's

@@ -50,25 +50,53 @@ require() {
 # JSON that keeps the dock entry intact. A broken shell.json costs you the
 # whole bar, not just the dock. Extra arguments are passed to jq, for
 # callers that need --arg/--argjson bindings in the expression.
+#
+# Writes are serialised with a lock: the settings GUI fires one subprocess
+# per change, and two read-modify-writes racing each other would silently
+# drop one of them. The backup goes to a file of our own — shell.json.bak
+# is where omarchy-refresh-shell leaves the user's config when it resets
+# to stock, and overwriting that on the next dock tweak would lose it.
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/omarchy-dock-config.lock"
+
 apply() {
   local expr=$1 tmp
   shift
-  tmp=$(mktemp "$CFG.XXXXXX") || return 1
+  exec {lockfd}>"$LOCK" || return 1
+  if ! flock -w 5 "$lockfd"; then
+    exec {lockfd}>&-
+    err "Another dock update is stuck — nothing changed."
+    return 1
+  fi
+
+  tmp=$(mktemp "$CFG.XXXXXX") || { exec {lockfd}>&-; return 1; }
 
   if ! jq "$@" "$DOCK |= ($expr)" "$CFG" >"$tmp" 2>/dev/null; then
     rm -f "$tmp"
+    exec {lockfd}>&-
     err "Update failed — nothing changed."
     return 1
   fi
 
   if ! jq -e "$DOCK | .id" "$tmp" >/dev/null 2>&1; then
     rm -f "$tmp"
+    exec {lockfd}>&-
     err "Update would have dropped the dock entry — nothing changed."
     return 1
   fi
 
-  cp "$CFG" "$CFG.bak"
+  # Skip no-op writes: every write makes the shell and every plugin
+  # watching shell.json reload for nothing.
+  if cmp -s "$tmp" "$CFG"; then
+    rm -f "$tmp"
+    exec {lockfd}>&-
+    return 0
+  fi
+
+  cp "$CFG" "$CFG.dock-bak"
+  # mktemp creates 0600; keep whatever mode the real file had.
+  chmod --reference="$CFG" "$tmp" 2>/dev/null
   mv "$tmp" "$CFG"
+  exec {lockfd}>&-
 }
 
 dock_field() { jq -r "$DOCK | $1" "$CFG" 2>/dev/null; }
@@ -1033,7 +1061,7 @@ require jq
 if ! jq -e "$DOCK | .id" "$CFG" >/dev/null 2>&1; then
   tmp=$(mktemp "$CFG.XXXXXX")
   if jq '.plugins = ((.plugins // []) + [{"id":"rdf.dock","items":[]}])' "$CFG" >"$tmp" 2>/dev/null; then
-    cp "$CFG" "$CFG.bak"
+    cp "$CFG" "$CFG.dock-bak"
     mv "$tmp" "$CFG"
   else
     rm -f "$tmp"

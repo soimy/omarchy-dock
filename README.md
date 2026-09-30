@@ -43,6 +43,15 @@ It ships as a third-party Quickshell plugin (`rdf.dock`) plus a settings
 GUI (right-click → Dock Settings…, or double-click the dock background)
 and a terminal configurator, `omarchy-dock-config`.
 
+The settings GUI is drawn with the shell's own controls and has two tabs.
+**Items** lists everything pinned — add an app (searchable), a command or a
+divider, reorder with the arrows or ↑/↓, and edit the selected item on the
+right: name, what it opens, what a click runs, icon or glyph, colour, size,
+a "only show while" command and the window class it matches. **Dock**
+holds the dock-wide settings in sections (position, size, look, running
+apps, show and hide), each with a reset-to-default button. Everything
+saves as you go; Undo puts back an item you edited or removed.
+
 ## Requirements
 
 - Omarchy (Hyprland + the Quickshell-based `omarchy-shell`)
@@ -147,7 +156,7 @@ shows when it exits 0).
 
 An item can be drawn as a Nerd Font glyph instead of its app icon, in the
 theme's ink, so the dock reads like the rest of the shell rather than a row
-of full-colour logos. Both pickers — **Change icon / glyph** in the settings
+of full-colour logos. Both pickers — **Icon → Glyph** in the settings
 GUI and `omarchy-dock-config` — offer the same catalogue: every icon the
 installed Nerd Font can actually draw, around 10,800 of them, from Material
 Design, Font Awesome, Devicons, Codicons, Octicons, the distro logos and the
@@ -183,7 +192,7 @@ A desktop-entry item can make one of its own Desktop Actions what a plain
 click runs — an RDP launcher's "Work PC" straight from the icon, a
 browser's private window. Right-click the icon → **Click Opens…** and pick
 it (the row a click runs wears the 󰍽 glyph in the menu from then on); or
-"Click action" in `omarchy-dock-config`; or "CLICK OPENS" in the settings
+"Click action" in `omarchy-dock-config`; or "A click opens" in the settings
 GUI; or by hand:
 
 ```json

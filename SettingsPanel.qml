@@ -5,18 +5,23 @@ import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 
-// The dock's settings GUI: item list on the left, editor on the right,
-// dock-wide settings behind "Dock…". Follows the emojis/clipboard overlay
-// idiom — fullscreen scrim, centered card, exclusive keyboard while open,
-// Esc closes.
+// The dock's settings GUI: an Items tab (list on the left, editor on the
+// right) and a Dock tab (dock-wide settings in sections). Follows the
+// emojis/clipboard overlay idiom — fullscreen scrim, centred card, exclusive
+// keyboard while open, Esc closes — and draws its controls with the shell's
+// own kit (ButtonGroup, ToggleSwitch, PanelSlider, TextField, Button), so it
+// reads as part of Omarchy rather than a lookalike.
 //
 // Every write goes through the configurator CLI (set-item / add / unpin /
-// move / set), never straight to shell.json — apply()'s staged-tempfile
-// validation stays the only writer, and the config hot-reload brings each
-// change back into the live dock, so edits preview instantly.
+// move / set), never straight to shell.json — apply()'s staged, locked,
+// validated write stays the only writer, and the config hot-reload brings
+// each change back into the live dock, so edits preview instantly.
 //
-// Item edits buffer locally and land on Save; dock-level settings apply as
-// they change (they're individually cheap and trivially reversible).
+// Everything applies as you go. Item edits are debounced and saved on a
+// short timer (and flushed before anything else touches the list); the
+// item as it was when selected is kept, so Undo can put it back. Writes run
+// through one queue, one at a time, in order — two fast clicks on "move up"
+// used to race as two detached processes and could move the wrong item.
 Item {
   id: root
 
@@ -25,17 +30,55 @@ Item {
   property bool opened: false
   property int selIndex: -1
   property bool dockPage: false
-  // "entries" or "glyphs" while a picker overlay is up, else "".
+  // "entries" or "glyphs" while a picker sheet is up, else "".
   property string picker: ""
+  // What an app pick is for: "set" changes the selected item's app, "add"
+  // pins a new one.
+  property string entryPurpose: "set"
 
   // The editing buffer: a plain copy of the selected item, mutated by the
-  // form and written back wholesale on Save.
+  // form and written back wholesale. `orig` is the item as it was when it
+  // was selected, for Undo.
   property var buf: ({})
+  property var orig: ({})
+  // Edits waiting on the save timer.
   property bool dirty: false
+  readonly property bool changedSinceSelect: JSON.stringify(buf) !== JSON.stringify(orig)
+
+  // Select an item once the list has settled at an expected length — how
+  // add and remove land on the right row after the config round-trip.
+  property var pendingSelect: null
+  // The last removed item and where it was, so Undo can put it back.
+  property var lastRemoved: null
+  property string errorText: ""
 
   readonly property var items: dock.items
   readonly property var selItem: (selIndex >= 0 && selIndex < items.length) ? items[selIndex] : null
   readonly property bool selIsSpacer: Util.isPlainObject(selItem) && selItem.spacer === true
+
+  readonly property color fg: Color.popups.text
+  readonly property color dim: Util.alpha(Color.popups.text, 0.6)
+  // PanelSlider takes its colours from a bar object; hand it one shaped
+  // like the popup surface it sits on.
+  readonly property QtObject sliderBar: QtObject {
+    property color foreground: Color.popups.text
+    property color background: Color.popups.background
+  }
+
+  onItemsChanged: {
+    var p = pendingSelect
+    if (p && items.length === p.len) {
+      pendingSelect = null
+      select(Math.min(p.index, items.length - 1))
+      return
+    }
+    // Something else changed the list (the context menu, a drag, the TUI):
+    // pick the selected item back up, unless we're mid-edit on it.
+    if (!dirty && selIndex >= 0 && selIndex < items.length && !pendingSelect)
+      buf = clone(items[selIndex])
+  }
+
+  // ---------------------------------------------------------------- glyphs
 
   // The glyph catalogue, shared with the TUI's picker via glyphs.json:
   // every icon the installed Nerd Font can actually draw, each tagged with
@@ -92,73 +135,6 @@ Item {
     return out
   }
 
-  function open() {
-    if (items.length > 0 && selIndex < 0) select(0)
-    opened = true
-    dockPage = false
-    picker = ""
-    if (glyphList.length === 0) loadGlyphs()
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
-  }
-
-  function close() {
-    opened = false
-    picker = ""
-    dock.settingsReleased()
-  }
-
-  // The glyph picker always opens on Popular with an empty search: landing
-  // in whatever filter the last visit left behind reads as a bug.
-  function openGlyphPicker() {
-    glyphQuery = ""
-    glyphCat = "popular"
-    glyphHint = ""
-    // The field holds its own text, so clearing only the query would leave
-    // last visit's search sitting above an unfiltered grid.
-    glyphSearch.text = ""
-    picker = "glyphs"
-    Qt.callLater(function () { glyphSearch.inner.forceActiveFocus() })
-  }
-
-  // Focus has to come back off the search field or the panel stops seeing
-  // Esc once a glyph picker has been open.
-  function closePicker() {
-    picker = ""
-    glyphHint = ""
-    keyCatcher.forceActiveFocus()
-  }
-
-  function select(i) {
-    selIndex = i
-    dockPage = false
-    buf = (i >= 0 && i < items.length) ? JSON.parse(JSON.stringify(items[i])) : {}
-    dirty = false
-  }
-
-  function setBuf(key, value) {
-    var next = JSON.parse(JSON.stringify(buf))
-    if (value === undefined) delete next[key]
-    else next[key] = value
-    buf = next
-    dirty = true
-  }
-
-  function save() {
-    if (!dirty || selIndex < 0) return
-    cli("set-item " + selIndex + " " + Util.shellQuote(JSON.stringify(buf)))
-    dirty = false
-  }
-
-  function revert() { select(selIndex) }
-
-  function cli(args) { Util.execDetached(root.dock.configCmd + " " + args) }
-
-  // Dock-level settings write straight through; the shell.json reload is
-  // the preview.
-  function setDock(key, value) {
-    cli("set " + key + " " + Util.shellQuote(JSON.stringify(value)))
-  }
-
   // QML's XMLHttpRequest won't read file:// without an env opt-in, so the
   // list comes through Quickshell's FileView instead, from the plugin's
   // own directory (see Dock.pluginDir).
@@ -174,7 +150,11 @@ Item {
     if (glyphsFile.path !== "") glyphsFile.reload()
   }
 
-  // Sorted desktop entries for the launch picker.
+  // ------------------------------------------------------------------ apps
+
+  property string appQuery: ""
+
+  // Sorted desktop entries for the app picker.
   readonly property var appEntries: {
     var out = []
     var values = (DesktopEntries.applications && DesktopEntries.applications.values) || []
@@ -189,208 +169,393 @@ Item {
     return out
   }
 
+  readonly property var appView: {
+    var terms = root.appQuery.toLowerCase().split(" ").filter(function (t) { return t !== "" })
+    if (terms.length === 0) return root.appEntries
+    return root.appEntries.filter(function (e) {
+      var hay = (String(e.name || "") + " " + String(e.id || "") + " " + String(e.genericName || "")).toLowerCase()
+      for (var t = 0; t < terms.length; t++) if (hay.indexOf(terms[t]) < 0) return false
+      return true
+    })
+  }
+
+  // ------------------------------------------------------------ open/close
+
+  function open() {
+    errorText = ""
+    lastRemoved = null
+    pendingSelect = null
+    if (items.length > 0 && (selIndex < 0 || selIndex >= items.length)) select(0)
+    else if (selIndex >= 0) select(selIndex)
+    opened = true
+    picker = ""
+    if (glyphList.length === 0) loadGlyphs()
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function close() {
+    flush()
+    opened = false
+    picker = ""
+    lastRemoved = null
+    dock.settingsReleased()
+  }
+
+  // Esc backs out one level: picker, then the panel.
+  function backOut() {
+    if (picker !== "") closePicker()
+    else close()
+  }
+
+  // The glyph picker always opens on Popular with an empty search: landing
+  // in whatever filter the last visit left behind reads as a bug.
+  function openGlyphPicker() {
+    glyphQuery = ""
+    glyphCat = "popular"
+    glyphHint = ""
+    // The field holds its own text, so clearing only the query would leave
+    // last visit's search sitting above an unfiltered grid.
+    glyphSearch.text = ""
+    picker = "glyphs"
+    Qt.callLater(function () { glyphSearch.forceActiveFocus() })
+  }
+
+  function openAppPicker(purpose) {
+    entryPurpose = purpose
+    appQuery = ""
+    appSearch.text = ""
+    picker = "entries"
+    Qt.callLater(function () { appSearch.forceActiveFocus() })
+  }
+
+  // Focus has to come back off the search field or the panel stops seeing
+  // Esc once a picker has been open.
+  function closePicker() {
+    picker = ""
+    glyphHint = ""
+    keyCatcher.forceActiveFocus()
+  }
+
+  function pickApp(entry) {
+    if (!entry) return
+    var id = String(entry.id).replace(/\.desktop$/, "")
+    if (entryPurpose === "add") {
+      addItem({ desktop: id })
+    } else {
+      var next = clone(buf)
+      next.desktop = id
+      delete next.exec
+      // An action id belongs to the old app's jump list.
+      delete next.action
+      setBufAll(next)
+    }
+    closePicker()
+  }
+
+  function pickGlyph(g) {
+    var next = clone(buf)
+    next.glyph = String(g.glyph || "")
+    delete next.icon
+    setBufAll(next)
+    closePicker()
+  }
+
+  // -------------------------------------------------------------- editing
+
+  function clone(v) { return JSON.parse(JSON.stringify(v === undefined ? {} : v)) }
+
+  function select(i) {
+    flush()
+    selIndex = i
+    dockPage = false
+    buf = (i >= 0 && i < items.length) ? clone(items[i]) : ({})
+    orig = clone(buf)
+    dirty = false
+  }
+
+  function moveSelection(delta) {
+    var i = selIndex + delta
+    if (i >= 0 && i < items.length) select(i)
+  }
+
+  function setBuf(key, value) {
+    var next = clone(buf)
+    if (value === undefined) delete next[key]
+    else next[key] = value
+    setBufAll(next)
+  }
+
+  function setBufAll(next) {
+    buf = next
+    dirty = true
+    saveTimer.restart()
+  }
+
+  Timer {
+    id: saveTimer
+    interval: 350
+    onTriggered: root.flush()
+  }
+
+  // Write any pending item edit now. Everything that changes the list's
+  // shape calls this first, so the queue sees the edit at the index it
+  // was made at.
+  function flush() {
+    saveTimer.stop()
+    if (!dirty) return
+    dirty = false
+    if (selIndex < 0) return
+    cli("set-item " + selIndex + " " + Util.shellQuote(JSON.stringify(buf)), "item:" + selIndex)
+  }
+
+  function undoItem() {
+    saveTimer.stop()
+    buf = clone(orig)
+    dirty = true
+    flush()
+  }
+
+  function addItem(item) {
+    flush()
+    lastRemoved = null
+    pendingSelect = { index: items.length, len: items.length + 1 }
+    cli("add " + Util.shellQuote(JSON.stringify(item)))
+  }
+
+  function removeSelected() {
+    var i = selIndex
+    if (i < 0 || i >= items.length) return
+    flush()
+    lastRemoved = { item: clone(items[i]), index: i, title: itemTitle(items[i]) }
+    pendingSelect = { index: Math.max(0, i === items.length - 1 ? i - 1 : i), len: items.length - 1 }
+    cli("unpin " + i)
+  }
+
+  function undoRemove() {
+    var r = lastRemoved
+    if (!r) return
+    lastRemoved = null
+    pendingSelect = { index: Math.min(r.index, items.length), len: items.length + 1 }
+    cli("add " + Util.shellQuote(JSON.stringify(r.item)) + " " + r.index)
+  }
+
+  function moveSelected(delta) {
+    var i = selIndex
+    var j = i + delta
+    if (i < 0 || j < 0 || j >= items.length) return
+    flush()
+    lastRemoved = null
+    cli("move " + i + " " + j)
+    selIndex = j
+  }
+
+  // Dock-level settings write straight through; the shell.json reload is
+  // the preview. Keyed, so a slider drag queues at most one pending write
+  // per setting however fast the pointer moves.
+  function setDock(key, value) {
+    if (key === "tileStyle") {
+      // Setting tileOpacity at all selects the flat style, so "button"
+      // has to clear both.
+      if (value === "flat") cli("set tileStyle '\"flat\"'", "dock:tileStyle")
+      else {
+        cli("set tileStyle null", "dock:tileStyle")
+        cli("set tileOpacity null", "dock:tileOpacity")
+      }
+      return
+    }
+    cli("set " + key + " " + Util.shellQuote(JSON.stringify(value)), "dock:" + key)
+  }
+
+  // ------------------------------------------------------------ write queue
+
+  property var queue: []
+  readonly property bool writerBusy: writer.running
+
+  function cli(args, key) {
+    var cmd = root.dock.configCmd + " " + args
+    var q = queue.slice()
+    if (key) {
+      for (var i = 0; i < q.length; i++) {
+        if (q[i].key === key) {
+          q[i] = { key: key, cmd: cmd }
+          queue = q
+          pump()
+          return
+        }
+      }
+    }
+    q.push({ key: key || "", cmd: cmd })
+    queue = q
+    pump()
+  }
+
+  function pump() {
+    if (writer.running || queue.length === 0) return
+    var next = queue[0]
+    queue = queue.slice(1)
+    writer.command = ["bash", "-c", next.cmd]
+    writer.running = true
+  }
+
+  Process {
+    id: writer
+    stderr: StdioCollector { id: writerErr }
+    onExited: function(code) {
+      if (code !== 0) {
+        var msg = String(writerErr.text || "").trim().replace(/^error:\s*/, "")
+        root.errorText = "Couldn't save" + (msg !== "" ? ": " + msg : ".")
+      } else {
+        root.errorText = ""
+      }
+      Qt.callLater(root.pump)
+    }
+  }
+
+  // ------------------------------------------------------------- item text
+
   function itemTitle(item) {
     if (!Util.isPlainObject(item)) return "(item)"
-    if (item.spacer === true) return "── divider ──"
+    if (item.spacer === true) return "Divider"
     if (item.label) return String(item.label)
     // Named after its click action, like the hover label is.
-    var action = root.dock.defaultAction(item, root.dock.desktopEntry(item))
+    var entry = root.dock.desktopEntry(item)
+    var action = root.dock.defaultAction(item, entry)
     if (action && action.name) return String(action.name)
+    if (entry && entry.name) return String(entry.name)
     return String(item.desktop || item.appId || item.exec || "(unnamed)")
   }
 
-  function itemGlyph(item) {
-    return (Util.isPlainObject(item) && item.glyph) ? String(item.glyph) : ""
+  function itemSubtitle(item) {
+    if (!Util.isPlainObject(item) || item.spacer === true) return ""
+    if (item.exec !== undefined) return item.exec === "" ? "No command yet" : String(item.exec)
+    return String(item.desktop || item.appId || "")
   }
 
   // ------------------------------------------------------------ components
+  //
+  // Inline components can't see this file's ids, so everything they need
+  // comes in through properties and signals.
 
   component SLabel: Text {
+    textFormat: Text.PlainText
     color: Util.alpha(Color.popups.text, 0.6)
-    font.family: Style.font.resolvedFamily
-    font.pixelSize: Math.max(10, Style.font.bodySmall - 2)
+    font.family: Style.font.family
+    font.pixelSize: Style.font.caption
+    font.bold: true
     font.letterSpacing: 0.5
   }
 
   component SText: Text {
+    textFormat: Text.PlainText
     color: Color.popups.text
-    font.family: Style.font.resolvedFamily
+    font.family: Style.font.family
     font.pixelSize: Style.font.bodySmall
   }
 
-  component SButton: Rectangle {
-    id: btn
-    property string label: ""
-    property bool accent: false
-    property bool enabled: true
-    signal clicked()
-    implicitWidth: Math.round(btnText.implicitWidth + Style.spacing.xl * 2)
-    implicitHeight: Math.round(Style.font.bodySmall + Style.spacing.md * 2)
-    radius: Math.max(2, Math.round(Style.cornerRadius / 2))
-    color: !enabled ? Util.alpha(Color.popups.text, 0.06)
-         : accent ? (btnHover.hovered ? Util.alpha(Color.accent, 0.85) : Color.accent)
-         : btnHover.hovered ? Util.alpha(Color.accent, 0.16) : Util.alpha(Color.popups.text, 0.08)
-    border.width: 1
-    border.color: accent ? "transparent" : Util.alpha(Color.popups.text, 0.25)
-    opacity: enabled ? 1 : 0.5
-    Text {
-      id: btnText
-      anchors.centerIn: parent
-      text: btn.label
-      color: btn.accent ? Color.popups.background : (btnHover.hovered ? Color.accent : Color.popups.text)
-      font.family: Style.font.resolvedFamily
-      font.pixelSize: Style.font.bodySmall
-    }
-    HoverHandler { id: btnHover; enabled: btn.enabled }
-    TapHandler { enabled: btn.enabled; onTapped: btn.clicked() }
-  }
-
-  component SInput: Rectangle {
-    id: field
-    property alias text: input.text
-    property alias inner: input
-    property string placeholder: ""
-    signal edited(string value)
+  component SField: TextField {
     signal escaped()
-    implicitHeight: Math.round(Style.font.bodySmall + Style.spacing.md * 2 + 2)
-    radius: Math.max(2, Math.round(Style.cornerRadius / 2))
-    color: Util.alpha(Color.background, 0.6)
-    border.width: 1
-    border.color: input.activeFocus ? Color.accent : Util.alpha(Color.popups.text, 0.25)
-    clip: true
-    TextInput {
-      id: input
-      anchors.fill: parent
-      anchors.leftMargin: Style.spacing.lg
-      anchors.rightMargin: Style.spacing.lg
-      verticalAlignment: TextInput.AlignVCenter
-      color: Color.popups.text
-      font.family: Style.font.resolvedFamily
-      font.pixelSize: Style.font.bodySmall
-      selectByMouse: true
-      selectionColor: Util.alpha(Color.accent, 0.4)
-      onTextEdited: field.edited(text)
-      Keys.onEscapePressed: field.escaped()
-    }
-    Text {
-      visible: input.text === ""
-      anchors.verticalCenter: parent.verticalCenter
-      x: Style.spacing.lg
-      text: field.placeholder
-      color: Util.alpha(Color.popups.text, 0.35)
-      font.family: Style.font.resolvedFamily
-      font.pixelSize: Style.font.bodySmall
-    }
+    foreground: Color.popups.text
+    font.pixelSize: Style.font.bodySmall
+    Keys.onEscapePressed: escaped()
   }
 
-  component SRadio: Item {
-    id: radio
-    property string label: ""
-    property bool on: false
-    signal picked()
-    implicitWidth: Math.round(ring.width + radioText.implicitWidth + Style.spacing.md)
-    implicitHeight: Math.round(Style.font.bodySmall + Style.spacing.md)
-    Rectangle {
-      id: ring
-      width: 13; height: 13; radius: 6.5
-      anchors.verticalCenter: parent.verticalCenter
-      color: "transparent"
-      border.width: radio.on ? 4 : 1.5
-      border.color: radio.on ? Color.accent : Util.alpha(Color.popups.text, 0.4)
-    }
-    Text {
-      id: radioText
-      anchors.verticalCenter: parent.verticalCenter
-      x: ring.width + Style.spacing.md
-      text: radio.label
-      color: radio.on ? Color.accent : Color.popups.text
-      font.family: Style.font.resolvedFamily
-      font.pixelSize: Style.font.bodySmall
-    }
-    TapHandler { onTapped: radio.picked() }
-    HoverHandler { cursorShape: Qt.PointingHandCursor }
+  component SButton: Button {
+    foreground: Color.popups.text
+    bordered: true
+    fontSize: Style.font.bodySmall
+    iconSize: Style.font.body
   }
 
-  component SCheck: Item {
-    id: check
+  component SGroup: ButtonGroup {
+    foreground: Color.popups.text
+    background: "transparent"
+    fontSize: Style.font.bodySmall
+    focusable: false
+  }
+
+  // One settings row: label on the left, control on the right, a readout
+  // under the label, and a reset button that appears once the setting has
+  // been changed from its default.
+  component SRow: Item {
+    id: srow
     property string label: ""
-    property bool on: false
-    signal toggled(bool value)
-    implicitWidth: Math.round(box.width + checkText.implicitWidth + Style.spacing.md)
-    implicitHeight: Math.round(Style.font.bodySmall + Style.spacing.md)
-    Rectangle {
-      id: box
-      width: 14; height: 14
-      radius: 3
+    property string readout: ""
+    property bool resettable: false
+    property int labelWidth: 160
+    signal reset()
+    default property alias control: slot.data
+
+    // Measured from the controls' implicit heights, not childrenRect: the
+    // controls are centred in the slot, and the slot takes this row's
+    // height, so childrenRect would feed back into itself.
+    readonly property real controlHeight: {
+      var h = 0
+      var kids = slot.children
+      for (var i = 0; i < kids.length; i++)
+        if (kids[i].visible) h = Math.max(h, kids[i].implicitHeight || 0)
+      return h
+    }
+    implicitHeight: Math.max(Style.spacing.controlHeight, controlHeight, labels.implicitHeight)
+                    + Style.spacing.sm * 2
+
+    Column {
+      id: labels
       anchors.verticalCenter: parent.verticalCenter
-      color: check.on ? Color.accent : "transparent"
-      border.width: 1.5
-      border.color: check.on ? Color.accent : Util.alpha(Color.popups.text, 0.4)
+      width: srow.labelWidth - Style.spacing.lg
+      spacing: 1
       Text {
-        visible: check.on
-        anchors.centerIn: parent
-        text: "✓"
-        color: Color.popups.background
-        font.pixelSize: 10
-        font.bold: true
+        width: parent.width
+        textFormat: Text.PlainText
+        text: srow.label
+        color: Color.popups.text
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+        elide: Text.ElideRight
+      }
+      Text {
+        visible: srow.readout !== ""
+        width: parent.width
+        textFormat: Text.PlainText
+        text: srow.readout
+        color: Util.alpha(Color.popups.text, 0.5)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
       }
     }
-    Text {
-      id: checkText
-      anchors.verticalCenter: parent.verticalCenter
-      x: box.width + Style.spacing.md
-      text: check.label
-      color: Color.popups.text
-      font.family: Style.font.resolvedFamily
-      font.pixelSize: Style.font.bodySmall
+
+    Item {
+      id: slot
+      x: srow.labelWidth
+      width: srow.width - x - resetBtn.width - Style.spacing.md
+      height: srow.height
     }
-    TapHandler { onTapped: check.toggled(!check.on) }
-    HoverHandler { cursorShape: Qt.PointingHandCursor }
+
+    Button {
+      id: resetBtn
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      opacity: srow.resettable ? 1 : 0
+      enabled: srow.resettable
+      iconText: "󰑓"
+      tooltipText: "Back to default"
+      foreground: Util.alpha(Color.popups.text, 0.7)
+      iconSize: Style.font.bodySmall
+      horizontalPadding: Style.spacing.sm
+      verticalPadding: Style.spacing.xs
+      onClicked: srow.reset()
+    }
   }
 
-  component SSlider: Item {
-    id: slider
-    property real from: 0
-    property real to: 1
-    property real value: 0
-    property real step: 0.05
-    signal moved(real value)
-    implicitHeight: 20
-    Rectangle {
-      id: track
-      anchors.verticalCenter: parent.verticalCenter
-      width: parent.width
-      height: 3
-      radius: 1.5
-      color: Util.alpha(Color.popups.text, 0.25)
-      Rectangle {
-        width: handle.x + handle.width / 2
-        height: parent.height
-        radius: 1.5
-        color: Color.accent
-      }
-    }
-    Rectangle {
-      id: handle
-      width: 13; height: 13; radius: 6.5
-      anchors.verticalCenter: parent.verticalCenter
-      x: (slider.value - slider.from) / (slider.to - slider.from) * (parent.width - width)
-      color: Color.accent
-    }
-    TapHandler {
-      onTapped: function(eventPoint) { slider.jump(eventPoint.position.x) }
-    }
-    DragHandler {
-      target: null
-      onCentroidChanged: if (active) slider.jump(centroid.position.x)
-    }
-    function jump(px) {
-      var f = Math.max(0, Math.min(1, (px - handle.width / 2) / (width - handle.width)))
-      var v = from + f * (to - from)
-      v = Math.round(v / step) * step
-      v = Math.max(from, Math.min(to, v))
-      if (Math.abs(v - value) > 1e-9) moved(v)
-    }
+  component SSection: Text {
+    textFormat: Text.PlainText
+    color: Color.accent
+    font.family: Style.font.family
+    font.pixelSize: Style.font.caption
+    font.bold: true
+    font.letterSpacing: 0.8
+    topPadding: Style.spacing.xl
+    bottomPadding: Style.spacing.xs
   }
 
   // ---------------------------------------------------------------- window
@@ -427,10 +592,9 @@ Item {
       id: keyCatcher
       anchors.fill: parent
       focus: true
-      Keys.onEscapePressed: {
-        if (root.picker !== "") root.closePicker()
-        else root.close()
-      }
+      Keys.onEscapePressed: root.backOut()
+      Keys.onUpPressed: if (root.picker === "" && !root.dockPage) root.moveSelection(-1)
+      Keys.onDownPressed: if (root.picker === "" && !root.dockPage) root.moveSelection(1)
     }
 
     BorderSurface {
@@ -442,19 +606,16 @@ Item {
         : (dock.edge === "top" ? 1 : -1) * Math.round(dock.windowCross / 2)
       anchors.horizontalCenterOffset: !dock.vertical ? 0
         : (dock.edge === "left" ? 1 : -1) * Math.round(dock.windowCross / 2)
-      // The glyph grid earns a bigger card than the two-pane form does.
-      width: Math.min(Style.space(root.picker === "glyphs" ? 740 : 640),
-                      panel.width - Style.space(40))
-      height: Math.min(Style.space(root.picker === "glyphs" ? 500 : 430),
-                       panel.height - Style.space(40))
+      width: Math.min(Style.space(780), panel.width - Style.space(40) - (dock.vertical ? dock.windowCross : 0))
+      height: Math.min(Style.space(560), panel.height - Style.space(40) - (dock.vertical ? 0 : dock.windowCross))
       radius: Style.cornerRadius
       color: Util.alpha(Color.popups.background, 0.99)
       borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
 
       readonly property int pad: Style.spacing.panelPadding
-      readonly property int headerH: Math.round(Style.font.body + Style.spacing.lg * 2)
-      readonly property int footerH: Math.round(Style.font.bodySmall + Style.spacing.lg * 3)
-      readonly property int listW: Style.space(210)
+      readonly property int headerH: Math.round(Style.spacing.controlHeight + Style.spacing.lg * 2)
+      readonly property int footerH: Math.round(Style.spacing.controlHeight + Style.spacing.lg * 2)
+      readonly property int listW: Style.space(240)
 
       // A picker sheet drawn over these panes does NOT stop their tap
       // handlers receiving the same clicks — passive grabs deliver to
@@ -467,41 +628,52 @@ Item {
       Item {
         id: header
         visible: root.picker === ""
-        x: card.pad; y: Style.spacing.md
+        x: card.pad; y: 0
         width: card.width - card.pad * 2
         height: card.headerH
 
         SText {
           anchors.verticalCenter: parent.verticalCenter
-          text: "󰒓  Dock — Settings"
-          font.pixelSize: Style.font.body
+          text: "󰒓  Dock settings"
+          font.pixelSize: Style.font.title
         }
-        Text {
+
+        SGroup {
+          anchors.centerIn: parent
+          options: [{ value: "items", label: "Items", icon: "󰕰" }, { value: "dock", label: "Dock", icon: "󱂩" }]
+          value: root.dockPage ? "dock" : "items"
+          onChanged: function(v) {
+            root.flush()
+            root.dockPage = v === "dock"
+            keyCatcher.forceActiveFocus()
+          }
+        }
+
+        Button {
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
-          text: "󰅖"
-          color: closeHover.hovered ? Color.accent : Util.alpha(Color.popups.text, 0.5)
-          font.family: Style.font.resolvedFamily
-          font.pixelSize: Style.font.body
-          HoverHandler { id: closeHover }
-          TapHandler { onTapped: root.close() }
+          iconText: "󰅖"
+          tooltipText: "Close (Esc)"
+          foreground: Color.popups.text
+          onClicked: root.close()
         }
       }
 
       Rectangle {
-        x: card.pad; y: header.y + header.height
+        visible: root.picker === ""
+        x: card.pad; y: header.height
         width: card.width - card.pad * 2; height: 1
-        color: Util.alpha(Color.popups.text, 0.15)
+        color: Util.alpha(Color.popups.text, 0.12)
       }
 
       // ------------------------------------------------------- item list
       Item {
         id: listPane
-        visible: root.picker === ""
+        visible: root.picker === "" && !root.dockPage
         x: card.pad
-        y: header.y + header.height + Style.spacing.md
+        y: header.height + Style.spacing.lg
         width: card.listW
-        height: card.height - y - card.footerH - Style.spacing.md
+        height: card.height - y - card.footerH - Style.spacing.sm
 
         ListView {
           id: itemList
@@ -510,42 +682,75 @@ Item {
           clip: true
           model: root.items
           spacing: 2
+          boundsBehavior: Flickable.StopAtBounds
+          currentIndex: root.selIndex
+          onCurrentIndexChanged: if (currentIndex >= 0) positionViewAtIndex(currentIndex, ListView.Contain)
 
           delegate: Rectangle {
             id: listRow
             required property var modelData
             required property int index
-            readonly property bool sel: index === root.selIndex && !root.dockPage
+            readonly property bool sel: index === root.selIndex
+            readonly property bool isSpacer: listRow.modelData.spacer === true
+            readonly property string glyph: listRow.modelData.glyph ? String(listRow.modelData.glyph) : ""
             width: itemList.width
-            height: Math.round(Style.font.bodySmall + Style.spacing.lg * 2)
+            height: isSpacer ? Math.round(Style.spacing.controlHeight * 0.8)
+                             : Math.round(Style.spacing.controlHeight + Style.spacing.sm * 2)
             radius: Math.max(2, Math.round(Style.cornerRadius / 2))
-            color: sel ? Util.alpha(Color.accent, 0.16)
-                 : rowHover.hovered ? Util.alpha(Color.popups.text, 0.06) : "transparent"
-            border.width: sel ? 1 : 0
-            border.color: Util.alpha(Color.accent, 0.4)
+            color: sel ? Style.selectedFillFor(Color.popups.text, Color.accent)
+                 : rowHover.hovered ? Style.hoverFillFor(Color.popups.text, Color.accent) : "transparent"
 
-            Text {
-              id: rowGlyph
+            // A divider reads as one in the list too.
+            Rectangle {
+              visible: listRow.isSpacer
+              anchors.verticalCenter: parent.verticalCenter
+              x: Style.spacing.lg
+              width: parent.width - Style.spacing.lg * 2
+              height: 1
+              color: Util.alpha(Color.popups.text, listRow.sel ? 0.6 : 0.25)
+            }
+
+            Item {
+              id: rowArt
+              visible: !listRow.isSpacer
               x: Style.spacing.md
               anchors.verticalCenter: parent.verticalCenter
-              width: Style.space(20)
-              text: root.itemGlyph(listRow.modelData)
-              color: listRow.sel ? Color.accent : Color.popups.text
-              font.family: Style.font.resolvedFamily
-              font.pixelSize: Style.font.bodySmall
+              width: Style.space(22); height: Style.space(22)
+              Text {
+                visible: listRow.glyph !== ""
+                anchors.centerIn: parent
+                text: listRow.glyph
+                color: listRow.sel ? Color.accent : Color.popups.text
+                font.family: Style.font.resolvedFamily
+                font.pixelSize: Style.font.title
+              }
+              Image {
+                visible: listRow.glyph === ""
+                anchors.fill: parent
+                source: listRow.glyph === "" && !listRow.isSpacer
+                  ? root.dock.itemIcon(listRow.modelData, root.dock.desktopEntry(listRow.modelData)) : ""
+                sourceSize.width: 44; sourceSize.height: 44
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
+                smooth: true
+              }
             }
             SText {
-              x: rowGlyph.x + rowGlyph.width + Style.spacing.md
+              visible: !listRow.isSpacer
+              x: rowArt.x + rowArt.width + Style.spacing.lg
               anchors.verticalCenter: parent.verticalCenter
               width: parent.width - x - Style.spacing.md
               text: root.itemTitle(listRow.modelData)
               elide: Text.ElideRight
-              color: listRow.sel ? Color.accent
-                   : listRow.modelData.spacer === true ? Util.alpha(Color.popups.text, 0.45)
-                   : Color.popups.text
+              color: listRow.sel ? Color.accent : Color.popups.text
             }
-            HoverHandler { id: rowHover }
-            TapHandler { onTapped: root.select(listRow.index) }
+            HoverHandler { id: rowHover; cursorShape: Qt.PointingHandCursor }
+            TapHandler {
+              onTapped: {
+                root.select(listRow.index)
+                keyCatcher.forceActiveFocus()
+              }
+            }
           }
         }
 
@@ -554,337 +759,540 @@ Item {
           anchors.bottom: parent.bottom
           spacing: Style.spacing.sm
 
-          SButton { label: "󰐕"; onClicked: {
-            root.cli("add " + Util.shellQuote(JSON.stringify({ label: "New Item", glyph: "󰛓", exec: "" })))
-            Qt.callLater(function() { root.select(root.items.length - 1) })
-          } }
-          SButton { label: "│"; onClicked: root.cli("add " + Util.shellQuote(JSON.stringify({ spacer: true }))) }
-          SButton { label: "󰍴"; enabled: root.selIndex >= 0; onClicked: {
-            var i = root.selIndex
-            root.cli("unpin " + i)
-            root.select(Math.max(-1, i - 1))
-          } }
-          SButton { label: "󰜷"; enabled: root.selIndex > 0; onClicked: {
-            var i = root.selIndex
-            root.cli("move " + i + " " + (i - 1)); root.selIndex = i - 1
-          } }
-          SButton { label: "󰜮"; enabled: root.selIndex >= 0 && root.selIndex < root.items.length - 1; onClicked: {
-            var i = root.selIndex
-            root.cli("move " + i + " " + (i + 1)); root.selIndex = i + 1
-          } }
-          SButton {
-            label: "Dock…"
-            accent: root.dockPage
-            onClicked: root.dockPage = !root.dockPage
-          }
+          SButton { iconText: "󰀻"; tooltipText: "Add an app"; onClicked: root.openAppPicker("add") }
+          SButton { iconText: "󰆍"; tooltipText: "Add a command or script"
+            onClicked: root.addItem({ label: "New command", glyph: "󰆍", exec: "" }) }
+          SButton { iconText: "󰇜"; tooltipText: "Add a divider"; onClicked: root.addItem({ spacer: true }) }
+          SButton { iconText: "󰜷"; tooltipText: "Move up"; enabled: root.selIndex > 0
+            opacity: enabled ? 1 : 0.4; onClicked: root.moveSelected(-1) }
+          SButton { iconText: "󰜮"; tooltipText: "Move down"
+            enabled: root.selIndex >= 0 && root.selIndex < root.items.length - 1
+            opacity: enabled ? 1 : 0.4; onClicked: root.moveSelected(1) }
+          SButton { iconText: "󰆴"; tooltipText: "Remove from the dock"; enabled: root.selIndex >= 0
+            opacity: enabled ? 1 : 0.4; onClicked: root.removeSelected() }
         }
       }
 
       Rectangle {
+        visible: listPane.visible
         x: card.pad + card.listW + Style.spacing.lg; y: listPane.y
         width: 1; height: listPane.height
-        color: Util.alpha(Color.popups.text, 0.15)
+        color: Util.alpha(Color.popups.text, 0.12)
       }
 
       // ------------------------------------------------------ editor pane
       Flickable {
         id: form
         visible: root.picker === ""
-        x: card.pad + card.listW + Style.spacing.lg * 2
-        y: listPane.y
+        x: root.dockPage ? card.pad : card.pad + card.listW + Style.spacing.lg * 2
+        y: header.height + Style.spacing.lg
         width: card.width - x - card.pad
-        height: listPane.height
+        height: card.height - y - card.footerH - Style.spacing.sm
         clip: true
         contentHeight: root.dockPage ? dockForm.implicitHeight : itemForm.implicitHeight
         contentWidth: width
+        flickableDirection: Flickable.VerticalFlick
         boundsBehavior: Flickable.StopAtBounds
+        onVisibleChanged: contentY = 0
+
+        // A thin scroll hint; the form is taller than the card on the Dock tab.
+        Rectangle {
+          parent: form
+          visible: form.contentHeight > form.height
+          x: form.width - width
+          y: form.visibleArea.yPosition * form.height
+          width: 3
+          height: Math.max(20, form.visibleArea.heightRatio * form.height)
+          radius: 1.5
+          color: Util.alpha(Color.popups.text, 0.3)
+        }
 
         // ------------------------------------------------ per-item editor
         Column {
           id: itemForm
           visible: !root.dockPage
-          width: form.width
-          spacing: Style.spacing.xl
+          width: form.width - Style.spacing.lg
+          spacing: 0
+
+          readonly property int lw: Math.round(width * 0.32)
+          readonly property var entry: root.buf.exec === undefined ? root.dock.desktopEntry(root.buf) : null
+          readonly property bool hasItem: root.selItem !== null && !root.selIsSpacer
 
           SText {
             visible: root.selItem === null
-            text: "Select an item on the left."
-            opacity: 0.6
+            topPadding: Style.spacing.xl
+            text: root.items.length === 0 ? "The dock is empty. Add an app with the buttons below the list." : "Pick an item on the left."
+            color: root.dim
           }
           SText {
             visible: root.selIsSpacer
-            text: "A divider. Reorder or remove it with the list buttons."
-            opacity: 0.6
+            topPadding: Style.spacing.xl
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "A divider. Move it or remove it with the buttons below the list."
+            color: root.dim
           }
 
-          Column {
-            visible: root.selItem !== null && !root.selIsSpacer
+          // What it is
+          SSection { visible: itemForm.hasItem; text: "ITEM"; topPadding: 0 }
+
+          SRow {
+            visible: itemForm.hasItem
             width: parent.width
-            spacing: Style.spacing.xl
-
-            Column {
+            labelWidth: itemForm.lw
+            label: "Name"
+            readout: ""
+            resettable: root.buf.label !== undefined
+            onReset: root.setBuf("label", undefined)
+            SField {
+              anchors.verticalCenter: parent.verticalCenter
               width: parent.width
-              spacing: Style.spacing.sm
-              SLabel { text: "LABEL" }
-              SInput {
-                width: parent.width
-                text: root.buf.label !== undefined ? String(root.buf.label) : ""
-                placeholder: "(from the desktop entry)"
-                onEdited: function(v) { root.setBuf("label", v === "" ? undefined : v) }
+              text: root.buf.label !== undefined ? String(root.buf.label) : ""
+              placeholderText: root.itemTitle(root.selItem && root.buf.label === undefined ? root.buf : {})
+              onTextEdited: root.setBuf("label", text === "" ? undefined : text)
+              onEscaped: root.backOut()
+            }
+          }
+
+          SRow {
+            visible: itemForm.hasItem
+            width: parent.width
+            labelWidth: itemForm.lw
+            label: "Opens"
+            SGroup {
+              anchors.verticalCenter: parent.verticalCenter
+              options: [{ value: "app", label: "An app" }, { value: "exec", label: "A command" }]
+              value: root.buf.exec === undefined ? "app" : "exec"
+              onChanged: function(v) {
+                if (v === "exec" && root.buf.exec === undefined) {
+                  var next = root.clone(root.buf)
+                  next.exec = ""
+                  delete next.action
+                  root.setBufAll(next)
+                } else if (v === "app" && root.buf.exec !== undefined) {
+                  root.setBuf("exec", undefined)
+                  if (!root.buf.desktop) root.openAppPicker("set")
+                }
               }
             }
+          }
 
-            Column {
+          SRow {
+            visible: itemForm.hasItem && root.buf.exec === undefined
+            width: parent.width
+            labelWidth: itemForm.lw
+            label: "App"
+            readout: root.buf.desktop && !itemForm.entry ? "Not installed" : ""
+            Rectangle {
+              id: appChooser
+              anchors.verticalCenter: parent.verticalCenter
               width: parent.width
-              spacing: Style.spacing.sm
-              SLabel { text: "LAUNCH" }
-              Row {
-                spacing: Style.spacing.xxl
-                SRadio {
-                  label: "Desktop entry"
-                  on: root.buf.exec === undefined
-                  onPicked: { root.setBuf("exec", undefined); root.picker = "entries" }
-                }
-                SRadio {
-                  label: "Command / script"
-                  on: root.buf.exec !== undefined
-                  onPicked: if (root.buf.exec === undefined) { root.setBuf("exec", ""); root.setBuf("action", undefined) }
-                }
-              }
-              SInput {
-                visible: root.buf.exec !== undefined
-                width: parent.width
-                text: root.buf.exec !== undefined ? String(root.buf.exec) : ""
-                placeholder: "command to run"
-                onEdited: function(v) { root.setBuf("exec", v) }
-              }
-              Rectangle {
-                visible: root.buf.exec === undefined
-                width: parent.width
-                height: Math.round(Style.font.bodySmall + Style.spacing.md * 2 + 2)
-                radius: Math.max(2, Math.round(Style.cornerRadius / 2))
-                color: Util.alpha(Color.background, 0.6)
-                border.width: 1
-                border.color: Util.alpha(Color.popups.text, 0.25)
-                SText {
-                  x: Style.spacing.lg
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: (root.buf.desktop ? String(root.buf.desktop) : "pick an app…") + "  ▾"
-                  opacity: root.buf.desktop ? 1 : 0.5
-                }
-                HoverHandler { cursorShape: Qt.PointingHandCursor }
-                TapHandler { onTapped: root.picker = "entries" }
-              }
-            }
-
-            // What a plain click runs, for a desktop entry that ships a
-            // jump list: the app itself, or one of its Desktop Actions
-            // (`"action": "<id>"`). Absent otherwise.
-            Column {
-              id: clickOpens
-              readonly property var entry: root.buf.exec === undefined ? root.dock.desktopEntry(root.buf) : null
-              readonly property var actions: root.dock.menuActions(entry)
-              readonly property string current: root.buf.action !== undefined ? String(root.buf.action) : ""
-              visible: actions.length > 0
-              width: parent.width
-              spacing: Style.spacing.sm
-              SLabel { text: "CLICK OPENS" }
-              Flow {
-                width: parent.width
-                spacing: Style.spacing.xxl
-                SRadio {
-                  label: "The app"
-                  on: clickOpens.current === ""
-                  onPicked: root.setBuf("action", undefined)
-                }
-                Repeater {
-                  model: clickOpens.actions
-                  delegate: SRadio {
-                    required property var modelData
-                    label: String(modelData.name || modelData.id || "Action")
-                    on: clickOpens.current === String(modelData.id || "")
-                    onPicked: root.setBuf("action", String(modelData.id || ""))
-                  }
-                }
+              height: Style.spacing.controlHeight + Style.spacing.xs * 2
+              radius: Style.cornerRadius
+              color: Style.controlFill(false, appHover.hovered, Color.popups.text, Color.accent)
+              border.width: 1
+              border.color: Util.alpha(Color.popups.text, appHover.hovered ? 0.4 : 0.2)
+              Image {
+                id: appChooserIcon
+                x: Style.spacing.lg
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(18); height: Style.space(18)
+                visible: itemForm.entry !== null
+                source: itemForm.entry ? root.dock.itemIcon({ desktop: root.buf.desktop }, itemForm.entry) : ""
+                sourceSize.width: 36; sourceSize.height: 36
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
               }
               SText {
-                visible: clickOpens.current !== "" && !clickOpens.actions.some(function(a) { return String(a.id || "") === clickOpens.current })
-                text: "Set to “" + clickOpens.current + "”, which this entry no longer ships — a click falls back to the app."
-                opacity: 0.6
-                wrapMode: Text.WordWrap
-                width: parent.width
+                x: appChooserIcon.visible ? appChooserIcon.x + appChooserIcon.width + Style.spacing.md : Style.spacing.lg
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width - x - chevron.width - Style.spacing.lg * 2
+                elide: Text.ElideRight
+                text: itemForm.entry ? String(itemForm.entry.name || root.buf.desktop)
+                    : root.buf.desktop ? String(root.buf.desktop) : "Choose an app…"
+                color: root.buf.desktop ? Color.popups.text : root.dim
               }
+              SText {
+                id: chevron
+                anchors.right: parent.right
+                anchors.rightMargin: Style.spacing.lg
+                anchors.verticalCenter: parent.verticalCenter
+                text: "󰅀"
+                color: root.dim
+              }
+              HoverHandler { id: appHover; cursorShape: Qt.PointingHandCursor }
+              TapHandler { onTapped: root.openAppPicker("set") }
             }
+          }
 
-            Column {
+          SRow {
+            visible: itemForm.hasItem && root.buf.exec !== undefined
+            width: parent.width
+            labelWidth: itemForm.lw
+            label: "Command"
+            readout: "Runs through bash"
+            SField {
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width
+              text: root.buf.exec !== undefined ? String(root.buf.exec) : ""
+              placeholderText: "e.g. omarchy launch terminal"
+              onTextEdited: root.setBuf("exec", text)
+              onEscaped: root.backOut()
+            }
+          }
+
+          // What a plain click runs, for a desktop entry that ships a
+          // jump list: the app itself, or one of its Desktop Actions
+          // (`"action": "<id>"`). Absent otherwise.
+          SRow {
+            id: clickOpens
+            readonly property var actions: root.dock.menuActions(itemForm.entry)
+            readonly property string current: root.buf.action !== undefined ? String(root.buf.action) : ""
+            readonly property bool stale: current !== "" && !actions.some(function(a) { return String(a.id || "") === current })
+            visible: itemForm.hasItem && actions.length > 0
+            width: parent.width
+            labelWidth: itemForm.lw
+            label: "A click opens"
+            readout: stale ? "Saved action is gone; opens the app" : ""
+            resettable: current !== ""
+            onReset: root.setBuf("action", undefined)
+            Flow {
+              anchors.verticalCenter: parent.verticalCenter
               width: parent.width
               spacing: Style.spacing.sm
-              SLabel { text: "ICON" }
-              Flow {
-                width: parent.width
-                spacing: Style.spacing.xxl
-                SRadio {
-                  label: "App icon"
-                  on: root.buf.glyph === undefined && root.buf.icon === undefined
-                  onPicked: { root.setBuf("glyph", undefined); root.setBuf("icon", undefined) }
-                }
-                Row {
-                  spacing: Style.spacing.md
-                  SRadio {
-                    label: "Glyph"
-                    on: root.buf.glyph !== undefined
-                    onPicked: root.openGlyphPicker()
-                  }
-                  SText {
-                    visible: root.buf.glyph !== undefined
-                    text: root.buf.glyph !== undefined ? String(root.buf.glyph) : ""
-                    font.pixelSize: Style.font.body
-                  }
-                  SButton {
-                    visible: root.buf.glyph !== undefined
-                    label: "Pick…"
-                    onClicked: root.openGlyphPicker()
-                  }
-                }
-                SRadio {
-                  label: "SVG / PNG / icon name"
-                  on: root.buf.icon !== undefined && root.buf.glyph === undefined
-                  onPicked: { root.setBuf("glyph", undefined); if (root.buf.icon === undefined) root.setBuf("icon", "") }
+              SButton {
+                text: "The app"
+                selected: clickOpens.current === "" || clickOpens.stale
+                onClicked: root.setBuf("action", undefined)
+              }
+              Repeater {
+                model: clickOpens.actions
+                delegate: SButton {
+                  required property var modelData
+                  text: String(modelData.name || modelData.id || "Action")
+                  selected: clickOpens.current === String(modelData.id || "")
+                  onClicked: root.setBuf("action", String(modelData.id || ""))
                 }
               }
-              SInput {
-                visible: root.buf.icon !== undefined && root.buf.glyph === undefined
-                width: parent.width
-                text: root.buf.icon !== undefined ? String(root.buf.icon) : ""
-                placeholder: "/path/to/icon.svg or icon-theme name"
-                onEdited: function(v) { root.setBuf("icon", v) }
+            }
+          }
+
+          // How it looks
+          SSection { visible: itemForm.hasItem; text: "LOOK" }
+
+          SRow {
+            visible: itemForm.hasItem
+            width: parent.width
+            labelWidth: itemForm.lw
+            label: "Icon"
+            SGroup {
+              anchors.verticalCenter: parent.verticalCenter
+              options: [{ value: "app", label: "App icon" }, { value: "glyph", label: "Glyph" }, { value: "file", label: "Image" }]
+              value: root.buf.glyph !== undefined ? "glyph" : root.buf.icon !== undefined ? "file" : "app"
+              onChanged: function(v) {
+                var next = root.clone(root.buf)
+                if (v === "app") { delete next.glyph; delete next.icon; root.setBufAll(next) }
+                else if (v === "glyph") root.openGlyphPicker()
+                else { delete next.glyph; if (next.icon === undefined) next.icon = ""; root.setBufAll(next) }
               }
             }
+          }
 
-            SCheck {
-              label: "Tint to theme accent"
-              on: root.buf.tint === true
-              onToggled: function(v) { root.setBuf("tint", v ? true : undefined) }
+          SRow {
+            visible: itemForm.hasItem && root.buf.glyph !== undefined
+            width: parent.width
+            labelWidth: itemForm.lw
+            label: "Glyph"
+            Row {
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.spacing.lg
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.buf.glyph !== undefined ? String(root.buf.glyph) : ""
+                color: Color.popups.text
+                font.family: Style.font.resolvedFamily
+                font.pixelSize: Style.font.displayLarge
+              }
+              SButton { anchors.verticalCenter: parent.verticalCenter; text: "Choose…"; onClicked: root.openGlyphPicker() }
             }
+          }
 
-            Column {
+          SRow {
+            visible: itemForm.hasItem && root.buf.icon !== undefined && root.buf.glyph === undefined
+            width: parent.width
+            labelWidth: itemForm.lw
+            label: "Image"
+            readout: "Path or icon name"
+            SField {
+              anchors.verticalCenter: parent.verticalCenter
               width: parent.width
-              spacing: Style.spacing.sm
-              SLabel {
-                readonly property real v: root.buf.iconScale !== undefined ? Number(root.buf.iconScale) : 1.0
-                text: "ICON SCALE · " + v.toFixed(2)
-              }
-              SSlider {
-                width: parent.width
-                from: 0.5; to: 1.6; step: 0.05
-                value: root.buf.iconScale !== undefined ? Number(root.buf.iconScale) : 1.0
-                onMoved: function(v) { root.setBuf("iconScale", Math.abs(v - 1.0) < 0.026 ? undefined : v) }
+              text: root.buf.icon !== undefined ? String(root.buf.icon) : ""
+              placeholderText: "/path/to/icon.svg or firefox"
+              onTextEdited: root.setBuf("icon", text)
+              onEscaped: root.backOut()
+            }
+          }
+
+          // Glyphs are already drawn in the theme colour; tinting is for
+          // artwork.
+          SRow {
+            visible: itemForm.hasItem && root.buf.glyph === undefined
+            width: parent.width
+            labelWidth: itemForm.lw
+            label: "Colour"
+            readout: root.buf.tint === undefined
+              ? (root.dock.tintIcons ? "Dock setting: theme colour" : "Dock setting: full colour") : ""
+            resettable: root.buf.tint !== undefined
+            onReset: root.setBuf("tint", undefined)
+            SGroup {
+              anchors.verticalCenter: parent.verticalCenter
+              options: [{ value: "full", label: "Full colour" }, { value: "tint", label: "Theme colour" }]
+              value: (root.buf.tint === undefined ? root.dock.tintIcons : root.buf.tint === true) ? "tint" : "full"
+              onChanged: function(v) { root.setBuf("tint", v === "tint") }
+            }
+          }
+
+          SRow {
+            id: scaleRow
+            visible: itemForm.hasItem
+            width: parent.width
+            labelWidth: itemForm.lw
+            readonly property real cur: root.buf.iconScale !== undefined ? Number(root.buf.iconScale) : 1.0
+            label: "Size"
+            readout: Math.round((scaleSlider.dragging ? scaleSlider.liveValue : cur) * 100) + "%"
+            resettable: root.buf.iconScale !== undefined
+            onReset: root.setBuf("iconScale", undefined)
+            PanelSlider {
+              id: scaleSlider
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width
+              bar: root.sliderBar
+              minimum: 0.5; maximum: 1.6; step: 0.05
+              value: scaleRow.cur
+              onReleased: function(v) {
+                var r = Math.round(v * 20) / 20
+                root.setBuf("iconScale", Math.abs(r - 1.0) < 0.001 ? undefined : r)
               }
             }
+          }
 
-            Column {
+          // The less common knobs
+          SSection { visible: itemForm.hasItem; text: "ADVANCED" }
+
+          SRow {
+            visible: itemForm.hasItem
+            width: parent.width
+            labelWidth: itemForm.lw
+            label: "Only show while"
+            readout: "Needs this to succeed"
+            resettable: root.buf.when !== undefined
+            onReset: root.setBuf("when", undefined)
+            SField {
+              anchors.verticalCenter: parent.verticalCenter
               width: parent.width
-              spacing: Style.spacing.sm
-              SLabel { text: "MATCH RUNNING WINDOWS BY APP-ID" }
-              SInput {
-                width: parent.width
-                text: root.buf.appId !== undefined
-                  ? (Array.isArray(root.buf.appId) ? root.buf.appId.join(", ") : String(root.buf.appId))
-                  : ""
-                placeholder: "(from the desktop entry)"
-                onEdited: function(v) {
-                  var t = v.trim()
-                  if (t === "") { root.setBuf("appId", undefined); return }
-                  var parts = t.split(",").map(function(s) { return s.trim() }).filter(function(s) { return s !== "" })
-                  root.setBuf("appId", parts.length === 1 ? parts[0] : parts)
-                }
+              text: root.buf.when !== undefined ? String(root.buf.when) : ""
+              placeholderText: "Always shown (e.g. pgrep xfreerdp)"
+              onTextEdited: root.setBuf("when", text.trim() === "" ? undefined : text)
+              onEscaped: root.backOut()
+            }
+          }
+
+          SRow {
+            visible: itemForm.hasItem
+            width: parent.width
+            labelWidth: itemForm.lw
+            label: "Window class"
+            readout: "Matches its windows"
+            resettable: root.buf.appId !== undefined
+            onReset: root.setBuf("appId", undefined)
+            SField {
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width
+              text: root.buf.appId !== undefined
+                ? (Array.isArray(root.buf.appId) ? root.buf.appId.join(", ") : String(root.buf.appId))
+                : ""
+              placeholderText: "Worked out from the app"
+              onTextEdited: {
+                var t = text.trim()
+                if (t === "") { root.setBuf("appId", undefined); return }
+                var parts = t.split(",").map(function(s) { return s.trim() }).filter(function(s) { return s !== "" })
+                root.setBuf("appId", parts.length === 1 ? parts[0] : parts)
               }
+              onEscaped: root.backOut()
             }
           }
         }
 
         // ------------------------------------------------ dock-wide page
+        //
+        // Schema-driven. Types: enum (options), num (whole numbers, unit),
+        // pct (a 0–1 fraction shown as a percentage), bool. `dflt: null`
+        // means the default comes from the theme, and `when` names a
+        // condition that has to hold for the row to show.
         Column {
           id: dockForm
           visible: root.dockPage
-          width: form.width
-          spacing: Style.spacing.xl
+          width: form.width - Style.spacing.lg
+          spacing: 0
 
-          // Generic schema-driven controls; null resets to the built-in
-          // default via `set <key> null`.
+          readonly property int lw: Math.round(width * 0.36)
+
+          function rowVisible(when) {
+            var c = root.dock.config
+            if (when === "tiles") return root.dock.tiles
+            if (when === "flatTiles") return root.dock.tiles && root.dock.tileStyle === "flat"
+            if (when === "running") return root.dock.showRunning
+            if (when === "labels") return root.dock.labels
+            return true
+          }
+
           Repeater {
             model: [
-              { key: "edge", label: "SCREEN EDGE", type: "enum", options: ["bottom", "top", "left", "right"], dflt: "bottom" },
-              { key: "align", label: "ALIGN ALONG EDGE", type: "enum", options: ["start", "center", "end"], dflt: "center" },
-              { key: "iconSize", label: "ICON SIZE", type: "num", from: 24, to: 96, step: 2, dflt: 40 },
-              { key: "spacing", label: "SPACING", type: "num", from: 0, to: 24, step: 1, dflt: 6 },
-              { key: "padding", label: "PADDING", type: "num", from: 0, to: 24, step: 1, dflt: 8 },
-              { key: "edgeGap", label: "EDGE GAP", type: "num", from: 0, to: 32, step: 1, dflt: 6 },
-              { key: "revealDelay", label: "REVEAL DELAY (MS)", type: "num", from: 0, to: 600, step: 10, dflt: 90 },
-              { key: "hideDelay", label: "HIDE DELAY (MS)", type: "num", from: 0, to: 1500, step: 25, dflt: 350 },
-              { key: "stackDelay", label: "WINDOW PREVIEW DELAY (MS)", type: "num", from: 0, to: 1500, step: 25, dflt: 300 },
-              { key: "hotspotHeight", label: "HOTSPOT HEIGHT", type: "num", from: 1, to: 12, step: 1, dflt: 2 },
+              { section: "POSITION" },
+              { key: "edge", label: "Screen edge", type: "enum", dflt: "bottom",
+                options: [{ value: "bottom", label: "Bottom" }, { value: "top", label: "Top" },
+                          { value: "left", label: "Left" }, { value: "right", label: "Right" }] },
+              { key: "align", label: "Position along the edge", type: "enum", dflt: "center",
+                options: [{ value: "start", label: "Start" }, { value: "center", label: "Centre" }, { value: "end", label: "End" }] },
               { key: "fullWidth", label: "Stretch along the whole edge", type: "bool", dflt: false },
-              { key: "labels", label: "Labels on hover", type: "bool", dflt: true },
-              { key: "magnify", label: "Hover magnify", type: "bool", dflt: true },
+              { key: "edgeGap", label: "Gap from the edge", type: "num", from: 0, to: 32, unit: "px", dflt: null },
+
+              { section: "SIZE" },
+              { key: "iconSize", label: "Icon size", type: "num", from: 24, to: 96, step: 2, unit: "px", dflt: 40 },
+              { key: "spacing", label: "Space between icons", type: "num", from: 0, to: 24, unit: "px", dflt: 6 },
+              { key: "padding", label: "Padding", type: "num", from: 0, to: 24, unit: "px", dflt: 8 },
+              { key: "glyphScale", label: "Glyph size", type: "pct", from: 30, to: 90, dflt: 0.58 },
+
+              { section: "LOOK" },
+              { key: "backgroundOpacity", label: "Background opacity", type: "pct", from: 0, to: 100, dflt: 1 },
+              { key: "iconOpacity", label: "Icon opacity", type: "pct", from: 20, to: 100, dflt: 1 },
+              { key: "border", label: "Border around the dock", type: "bool", dflt: true },
+              { key: "cornerRadius", label: "Corner rounding", type: "num", from: 0, to: 32, unit: "px", dflt: null },
+              { key: "glyphColor", label: "Glyph colour", type: "enum", dflt: "text",
+                options: [{ value: "text", label: "Text" }, { value: "accent", label: "Accent" }] },
               { key: "tiles", label: "Tiles behind icons", type: "bool", dflt: false },
-              { key: "border", label: "Card border", type: "bool", dflt: true },
-              { key: "hideOnLaunch", label: "Hide after launching", type: "bool", dflt: true },
+              { key: "tileStyle", label: "Tile style", type: "enum", dflt: "button", when: "tiles",
+                options: [{ value: "button", label: "Button" }, { value: "flat", label: "Flat" }] },
+              { key: "tileOpacity", label: "Tile opacity", type: "pct", from: 0, to: 60, dflt: 0.16, when: "flatTiles" },
+              { key: "tileRadius", label: "Tile rounding", type: "pct", from: 0, to: 50, dflt: null, when: "tiles" },
+              { key: "tileInset", label: "Icon size inside tiles", type: "pct", from: 50, to: 100, dflt: 0.76, when: "tiles" },
+              { key: "magnify", label: "Grow icons on hover", type: "bool", dflt: true },
+              { key: "labels", label: "Names on hover", type: "bool", dflt: true },
+
+              { section: "RUNNING APPS" },
+              { key: "showRunning", label: "Show unpinned running apps", type: "bool", dflt: true },
+              { key: "runningIndicator", label: "Running marker", type: "enum", dflt: "dot",
+                options: [{ value: "dot", label: "Dot" }, { value: "line", label: "Line" }, { value: "none", label: "None" }] },
+              { key: "tintIcons", label: "Pinned icons in theme colour", type: "bool", dflt: false },
+              { key: "tintRunning", label: "Running icons in theme colour", type: "bool", dflt: true, when: "running" },
+              { key: "stackDelay", label: "Window preview delay", type: "num", from: 0, to: 1500, step: 25, unit: "ms", dflt: 300 },
+              { key: "hoverActivate", label: "Focus a window by hovering its preview", type: "bool", dflt: false },
+
+              { section: "SHOW AND HIDE" },
+              { key: "revealDelay", label: "Delay before showing", type: "num", from: 0, to: 600, step: 10, unit: "ms", dflt: 90 },
+              { key: "hideDelay", label: "Delay before hiding", type: "num", from: 0, to: 1500, step: 25, unit: "ms", dflt: 350 },
+              { key: "hideOnLaunch", label: "Hide after opening something", type: "bool", dflt: true },
               { key: "showWhenEmpty", label: "Stay up on empty workspaces", type: "bool", dflt: false },
-              { key: "hotspotFullWidth", label: "Hotspot spans the whole edge", type: "bool", dflt: false },
-              { key: "showRunning", label: "Show running apps", type: "bool", dflt: true },
-              { key: "tintIcons", label: "Tint pinned icons", type: "bool", dflt: false },
-              { key: "tintRunning", label: "Tint running icons", type: "bool", dflt: true },
-              { key: "runningIndicator", label: "RUNNING INDICATOR", type: "enum", options: ["dot", "line", "none"], dflt: "dot" }
+              { key: "hotspotHeight", label: "Trigger strip thickness", type: "num", from: 1, to: 12, unit: "px", dflt: 2 },
+              { key: "hotspotFullWidth", label: "Trigger along the whole edge", type: "bool", dflt: false }
             ]
 
-            delegate: Column {
+            delegate: Item {
               id: ctl
               required property var modelData
-              readonly property var cur: root.dock.config[modelData.key]
+              readonly property var m: modelData
+              readonly property bool isSection: m.section !== undefined
+              readonly property var raw: isSection ? undefined : root.dock.config[m.key]
+              readonly property bool isSet: m.key === "tileStyle"
+                ? (root.dock.config.tileStyle !== undefined || root.dock.config.tileOpacity !== undefined)
+                : raw !== undefined
+              // What the dock is actually using, set or not.
+              readonly property var effective: {
+                if (isSection) return undefined
+                if (m.key === "tileStyle") return root.dock.tileStyle
+                if (m.key === "edgeGap") return root.dock.config.edgeGap !== undefined ? Number(raw) : Math.round(root.dock.edgeGap / Math.max(0.01, Style.spacing.scale))
+                if (m.key === "cornerRadius") return raw !== undefined ? Number(raw) : root.dock.cardRadius
+                if (m.key === "tileRadius") return raw !== undefined ? root.dock.fraction("tileRadius", 0.23) : root.dock.tileRadiusPx / Math.max(1, root.dock.slot)
+                if (m.type === "bool") return typeof raw === "boolean" ? raw : m.dflt
+                if (m.type === "pct") return root.dock.fraction(m.key, m.dflt)
+                if (m.type === "num") return raw !== undefined && isFinite(Number(raw)) ? Number(raw) : m.dflt
+                return raw !== undefined ? String(raw) : m.dflt
+              }
+
+              visible: isSection || dockForm.rowVisible(m.when)
               width: dockForm.width
-              spacing: Style.spacing.sm
+              height: visible ? (isSection ? sectionText.implicitHeight : row.implicitHeight) : 0
 
-              SLabel {
-                visible: ctl.modelData.type !== "bool"
-                text: ctl.modelData.label + (ctl.modelData.type === "num"
-                  ? " · " + (ctl.cur !== undefined ? Number(ctl.cur) : ctl.modelData.dflt) : "")
+              SSection {
+                id: sectionText
+                visible: ctl.isSection
+                text: ctl.isSection ? ctl.m.section : ""
+                topPadding: ctl.m.section === "POSITION" ? 0 : Style.spacing.xl
               }
 
-              SSlider {
-                visible: ctl.modelData.type === "num"
+              SRow {
+                id: row
+                visible: !ctl.isSection
                 width: parent.width
-                // Bool/enum rows instantiate this too (visible only gates
-                // paint), so the bounds need real numbers regardless.
-                from: Number(ctl.modelData.from || 0)
-                to: Number(ctl.modelData.to || 1)
-                step: Number(ctl.modelData.step || 0.05)
-                value: ctl.cur !== undefined ? Number(ctl.cur) : Number(ctl.modelData.dflt || 0)
-                onMoved: function(v) {
-                  root.setDock(ctl.modelData.key, v === ctl.modelData.dflt ? null : v)
+                labelWidth: dockForm.lw
+                label: ctl.m.label || ""
+                resettable: ctl.isSet
+                onReset: root.setDock(ctl.m.key, null)
+                readout: {
+                  if (ctl.isSection || ctl.m.type === "bool" || ctl.m.type === "enum") return ""
+                  var live = slider.dragging ? slider.liveValue : null
+                  var text = ctl.m.type === "pct"
+                    ? Math.round(live !== null ? live : ctl.effective * 100) + "%"
+                    : Math.round(live !== null ? live : ctl.effective) + " " + ctl.m.unit
+                  return (!ctl.isSet && ctl.m.dflt === null && live === null) ? text + " · from the theme" : text
                 }
-              }
 
-              SCheck {
-                visible: ctl.modelData.type === "bool"
-                label: ctl.modelData.label
-                on: ctl.cur !== undefined ? ctl.cur === true : ctl.modelData.dflt === true
-                onToggled: function(v) {
-                  root.setDock(ctl.modelData.key, v === ctl.modelData.dflt ? null : v)
-                }
-              }
-
-              Row {
-                visible: ctl.modelData.type === "enum"
-                spacing: Style.spacing.xxl
-                Repeater {
-                  model: ctl.modelData.type === "enum" ? ctl.modelData.options : []
-                  delegate: SRadio {
-                    required property var modelData
-                    label: modelData
-                    on: (ctl.cur !== undefined ? String(ctl.cur) : ctl.modelData.dflt) === modelData
-                    onPicked: root.setDock(ctl.modelData.key, modelData === ctl.modelData.dflt ? null : modelData)
+                SGroup {
+                  visible: ctl.m.type === "enum"
+                  anchors.verticalCenter: parent.verticalCenter
+                  options: ctl.m.type === "enum" ? ctl.m.options : []
+                  value: ctl.m.type === "enum" ? String(ctl.effective) : ""
+                  onChanged: function(v) {
+                    root.setDock(ctl.m.key, (v === ctl.m.dflt && ctl.m.key !== "tileStyle") ? null : v)
                   }
+                }
+
+                ToggleSwitch {
+                  visible: ctl.m.type === "bool"
+                  anchors.verticalCenter: parent.verticalCenter
+                  checked: ctl.m.type === "bool" && ctl.effective === true
+                  foreground: Color.popups.text
+                  onToggled: {
+                    var v = !(ctl.effective === true)
+                    root.setDock(ctl.m.key, v === ctl.m.dflt ? null : v)
+                  }
+                }
+
+                // Every row instantiates this (visible only gates paint), so
+                // the bounds need real numbers regardless of type.
+                PanelSlider {
+                  id: slider
+                  visible: ctl.m.type === "num" || ctl.m.type === "pct"
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width
+                  bar: root.sliderBar
+                  minimum: Number(ctl.m.from || 0)
+                  maximum: Number(ctl.m.to || 1)
+                  step: Number(ctl.m.step || 1)
+                  integer: true
+                  value: ctl.m.type === "pct" ? Math.round(Number(ctl.effective) * 100)
+                       : ctl.m.type === "num" ? Number(ctl.effective) : 0
+                  function commit(v) {
+                    var s = Number(ctl.m.step || 1)
+                    var n = Math.round(v / s) * s
+                    var stored = ctl.m.type === "pct" ? Math.round(n) / 100 : n
+                    if (ctl.m.dflt !== null && Math.abs(stored - ctl.m.dflt) < 0.0001) stored = null
+                    root.setDock(ctl.m.key, stored)
+                  }
+                  // Moves preview live; the write queue folds a fast drag
+                  // into one pending write per setting.
+                  onMoved: function(v) { commit(v) }
+                  onReleased: function(v) { commit(v) }
                 }
               }
             }
@@ -894,35 +1302,48 @@ Item {
 
       // ------------------------------------------------------------ footer
       Rectangle {
+        visible: root.picker === ""
         x: card.pad; y: card.height - card.footerH
         width: card.width - card.pad * 2; height: 1
-        color: Util.alpha(Color.popups.text, 0.15)
+        color: Util.alpha(Color.popups.text, 0.12)
       }
 
       Item {
         visible: root.picker === ""
         x: card.pad
-        y: card.height - card.footerH + Style.spacing.md
+        y: card.height - card.footerH
         width: card.width - card.pad * 2
-        height: card.footerH - Style.spacing.md * 2
+        height: card.footerH
 
-        SLabel {
+        SText {
           anchors.verticalCenter: parent.verticalCenter
-          width: parent.width - buttons.width - Style.spacing.xl
+          width: parent.width - footerButtons.width - Style.spacing.xl
           elide: Text.ElideRight
-          text: root.dockPage
-            ? "Changes apply live via omarchy-dock-config set"
-            : "Saved via omarchy-dock-config set-item — validated before it touches shell.json"
+          color: root.errorText !== "" ? Color.urgent : root.dim
+          text: root.errorText !== "" ? root.errorText
+              : root.lastRemoved ? "Removed “" + root.lastRemoved.title + "”."
+              : root.dockPage ? "Changes apply straight away."
+              : root.changedSinceSelect ? "Saved. Undo puts this item back how it was."
+              : "Changes save as you go.  ↑↓ to move through the list."
         }
 
         Row {
-          id: buttons
+          id: footerButtons
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
           spacing: Style.spacing.md
-          visible: !root.dockPage
-          SButton { label: "Revert"; enabled: root.dirty; onClicked: root.revert() }
-          SButton { label: "Save"; accent: true; enabled: root.dirty; onClicked: root.save() }
+          SButton {
+            visible: root.lastRemoved !== null
+            text: "Undo remove"
+            iconText: "󰕌"
+            onClicked: root.undoRemove()
+          }
+          SButton {
+            visible: !root.dockPage && root.lastRemoved === null && root.changedSinceSelect
+            text: "Undo changes"
+            iconText: "󰕌"
+            onClicked: root.undoItem()
+          }
         }
       }
 
@@ -931,27 +1352,32 @@ Item {
         visible: root.picker !== ""
         anchors.fill: parent
         radius: card.radius
-        color: Util.alpha(Color.popups.background, 0.98)
-
-        TapHandler { }
+        color: "transparent"
 
         SText {
           id: pickerTitle
-          x: card.pad; y: Style.spacing.lg
-          text: root.picker === "entries" ? "Pick an app" : "Pick a glyph"
-          font.pixelSize: Style.font.body
+          x: card.pad
+          height: card.headerH
+          verticalAlignment: Text.AlignVCenter
+          text: root.picker === "entries"
+            ? (root.entryPurpose === "add" ? "Add an app" : "Choose an app")
+            : "Choose a glyph"
+          font.pixelSize: Style.font.title
         }
 
         // Doubles as the hover caption and the result count — the tiles are
         // too small to label individually.
         SLabel {
-          visible: root.picker === "glyphs"
           anchors.verticalCenter: pickerTitle.verticalCenter
           x: pickerTitle.x + pickerTitle.implicitWidth + Style.spacing.xl
           width: Math.max(0, pickerBack.x - x - Style.spacing.lg)
           elide: Text.ElideRight
-          color: root.glyphHint !== "" ? Color.accent : Util.alpha(Color.popups.text, 0.6)
-          text: root.glyphHint !== "" ? root.glyphHint
+          font.bold: false
+          color: root.glyphHint !== "" ? Color.accent : root.dim
+          text: root.picker === "entries"
+              ? (root.appView.length === root.appEntries.length ? root.appEntries.length + " apps"
+                 : root.appView.length + " of " + root.appEntries.length)
+              : root.glyphHint !== "" ? root.glyphHint
               : root.glyphView.length === root.glyphList.length
                 ? root.glyphList.length + " glyphs"
                 : root.glyphView.length + " of " + root.glyphList.length
@@ -961,25 +1387,89 @@ Item {
           id: pickerBack
           anchors.right: parent.right
           anchors.rightMargin: card.pad
-          y: Style.spacing.lg
-          label: "Back"
+          anchors.verticalCenter: pickerTitle.verticalCenter
+          text: "Back"
+          iconText: "󰁍"
           onClicked: root.closePicker()
         }
 
+        // ------------------------------------------------ app search + list
+        SField {
+          id: appSearch
+          visible: root.picker === "entries"
+          x: card.pad
+          y: card.headerH
+          width: parent.width - card.pad * 2
+          placeholderText: "Search apps"
+          onTextEdited: root.appQuery = text
+          onAccepted: if (root.appView.length > 0) root.pickApp(root.appView[0])
+          onEscaped: root.closePicker()
+        }
+
+        ListView {
+          visible: root.picker === "entries"
+          x: card.pad; y: appSearch.y + appSearch.height + Style.spacing.md
+          width: parent.width - card.pad * 2
+          height: parent.height - y - card.pad
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          model: root.picker === "entries" ? root.appView : []
+          onModelChanged: positionViewAtBeginning()
+          delegate: Rectangle {
+            id: appRow
+            required property var modelData
+            required property int index
+            // Enter picks the top match, so it wears the hover look.
+            readonly property bool hot: entryHover.hovered || (appRow.index === 0 && root.appQuery !== "")
+            width: ListView.view ? ListView.view.width : 0
+            height: Math.round(Style.spacing.controlHeight + Style.spacing.sm * 2)
+            radius: Math.max(2, Math.round(Style.cornerRadius / 2))
+            color: hot ? Style.hoverFillFor(Color.popups.text, Color.accent) : "transparent"
+            Image {
+              id: entryIcon
+              x: Style.spacing.md
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(22); height: Style.space(22)
+              source: root.dock.itemIcon({ desktop: String(appRow.modelData.id) }, appRow.modelData)
+              sourceSize.width: 44; sourceSize.height: 44
+              fillMode: Image.PreserveAspectFit
+              asynchronous: true
+            }
+            SText {
+              id: entryName
+              x: entryIcon.x + entryIcon.width + Style.spacing.lg
+              anchors.verticalCenter: parent.verticalCenter
+              text: String(appRow.modelData.name || appRow.modelData.id)
+              color: appRow.hot ? Color.accent : Color.popups.text
+            }
+            SText {
+              x: entryName.x + entryName.implicitWidth + Style.spacing.lg
+              anchors.verticalCenter: parent.verticalCenter
+              width: Math.max(0, parent.width - x - Style.spacing.md)
+              elide: Text.ElideRight
+              text: String(appRow.modelData.genericName || appRow.modelData.comment || "")
+              color: root.dim
+            }
+            HoverHandler { id: entryHover; cursorShape: Qt.PointingHandCursor }
+            TapHandler { onTapped: root.pickApp(appRow.modelData) }
+          }
+        }
+
         // ---------------------------------------------- glyph search + cats
-        SInput {
+        SField {
           id: glyphSearch
           visible: root.picker === "glyphs"
           x: card.pad
-          y: pickerTitle.y + pickerTitle.height + Style.spacing.lg
+          y: card.headerH
           width: parent.width - card.pad * 2
-          placeholder: "Search by name, app, or category — try  folder, rust, arrow"
-          onEdited: function (value) {
-            root.glyphQuery = String(value).toLowerCase()
+          placeholderText: "Search by name, app, or category, e.g. folder, rust, arrow"
+          onTextEdited: {
+            root.glyphQuery = String(text).toLowerCase()
             // Searching from Popular would mostly come back empty, so the
             // first keystroke widens the filter to the whole catalogue.
             if (root.glyphQuery !== "" && root.glyphCat === "popular") root.glyphCat = "all"
           }
+          onAccepted: if (root.glyphView.length > 0) root.pickGlyph(root.glyphView[0])
           onEscaped: root.closePicker()
         }
 
@@ -992,79 +1482,18 @@ Item {
           y: glyphSearch.y + glyphSearch.height + Style.spacing.md
           width: parent.width - card.pad * 2
           spacing: Style.spacing.sm
-          readonly property int rowHeight: Math.round(Style.font.bodySmall + Style.spacing.md * 2)
           Repeater {
             model: root.glyphCats
-            delegate: Rectangle {
-            id: chip
-            required property var modelData
-            readonly property bool on: root.glyphCat === chip.modelData.id
-            width: Math.round(chipText.implicitWidth + Style.spacing.xl * 2)
-            height: glyphChips.rowHeight
-            radius: Math.round(height / 2)
-            color: chip.on ? Color.accent
-                 : chipHover.hovered ? Util.alpha(Color.accent, 0.16)
-                 : Util.alpha(Color.popups.text, 0.08)
-            border.width: 1
-            border.color: chip.on ? "transparent" : Util.alpha(Color.popups.text, 0.2)
-            Text {
-              id: chipText
-              anchors.centerIn: parent
-              text: chip.modelData.label
-              color: chip.on ? Color.popups.background
-                   : chipHover.hovered ? Color.accent : Color.popups.text
-              font.family: Style.font.resolvedFamily
-              font.pixelSize: Style.font.bodySmall
-            }
-            HoverHandler { id: chipHover; cursorShape: Qt.PointingHandCursor }
-            TapHandler { onTapped: root.glyphCat = chip.modelData.id }
+            delegate: SButton {
+              required property var modelData
+              text: modelData.label
+              selected: root.glyphCat === modelData.id
+              verticalPadding: Style.spacing.xs
+              onClicked: root.glyphCat = modelData.id
             }
           }
         }
 
-        // App list
-        ListView {
-          visible: root.picker === "entries"
-          x: card.pad; y: pickerTitle.y + pickerTitle.height + Style.spacing.lg
-          width: parent.width - card.pad * 2
-          height: parent.height - y - card.pad
-          clip: true
-          model: root.picker === "entries" ? root.appEntries : []
-          delegate: Rectangle {
-            required property var modelData
-            width: parent ? parent.width : 0
-            height: Math.round(Style.font.bodySmall + Style.spacing.lg * 2)
-            radius: Math.max(2, Math.round(Style.cornerRadius / 2))
-            color: entryHover.hovered ? Util.alpha(Color.accent, 0.16) : "transparent"
-            Image {
-              id: entryIcon
-              x: Style.spacing.md
-              anchors.verticalCenter: parent.verticalCenter
-              width: Style.space(18); height: Style.space(18)
-              source: modelData.icon ? Quickshell.iconPath(String(modelData.icon), true) : ""
-              sourceSize.width: 36; sourceSize.height: 36
-              fillMode: Image.PreserveAspectFit
-              asynchronous: true
-            }
-            SText {
-              x: entryIcon.x + entryIcon.width + Style.spacing.lg
-              anchors.verticalCenter: parent.verticalCenter
-              width: parent.width - x - Style.spacing.md
-              elide: Text.ElideRight
-              text: String(modelData.name || modelData.id)
-            }
-            HoverHandler { id: entryHover }
-            TapHandler {
-              onTapped: {
-                root.setBuf("desktop", String(modelData.id).replace(/\.desktop$/, ""))
-                root.setBuf("exec", undefined)
-                root.closePicker()
-              }
-            }
-          }
-        }
-
-        // Glyph grid
         GridView {
           id: glyphGrid
           visible: root.picker === "glyphs"
@@ -1072,6 +1501,7 @@ Item {
           width: parent.width - card.pad * 2
           height: parent.height - y - card.pad
           clip: true
+          boundsBehavior: Flickable.StopAtBounds
           cellWidth: Style.space(46)
           cellHeight: Style.space(46)
           // The model is a fresh array on every keystroke; without this the
@@ -1081,20 +1511,25 @@ Item {
           delegate: Rectangle {
             id: cell
             required property var modelData
+            required property int index
+            readonly property bool current: root.buf.glyph !== undefined && String(root.buf.glyph) === String(cell.modelData.glyph)
+            readonly property bool hot: glyphHover.hovered || (cell.index === 0 && root.glyphQuery !== "")
             width: Style.space(42); height: Style.space(42)
             radius: Math.max(2, Math.round(Style.cornerRadius / 2))
-            color: glyphHover.hovered ? Util.alpha(Color.accent, 0.16) : "transparent"
+            color: cell.hot ? Style.hoverFillFor(Color.popups.text, Color.accent)
+                 : cell.current ? Style.selectedFillFor(Color.popups.text, Color.accent) : "transparent"
             border.width: 1
-            border.color: Util.alpha(Color.popups.text, glyphHover.hovered ? 0.4 : 0.15)
+            border.color: cell.current ? Color.accent : Util.alpha(Color.popups.text, cell.hot ? 0.4 : 0.12)
             Text {
               anchors.centerIn: parent
               text: String(cell.modelData.glyph || "")
-              color: glyphHover.hovered ? Color.accent : Color.popups.text
+              color: cell.hot || cell.current ? Color.accent : Color.popups.text
               font.family: Style.font.resolvedFamily
               font.pixelSize: Style.font.title
             }
             HoverHandler {
               id: glyphHover
+              cursorShape: Qt.PointingHandCursor
               // Each cell owns the caption while the pointer is on it, and
               // only clears one it still owns — otherwise sliding across the
               // grid leaves the caption blank as often as not.
@@ -1104,23 +1539,19 @@ Item {
                 else if (root.glyphHint === name) root.glyphHint = ""
               }
             }
-            TapHandler {
-              onTapped: {
-                root.setBuf("glyph", String(cell.modelData.glyph || ""))
-                root.setBuf("icon", undefined)
-                root.closePicker()
-              }
-            }
+            TapHandler { onTapped: root.pickGlyph(cell.modelData) }
           }
         }
 
         SText {
-          visible: root.picker === "glyphs" && root.glyphView.length === 0
+          visible: (root.picker === "glyphs" && root.glyphView.length === 0)
+                || (root.picker === "entries" && root.appView.length === 0)
           anchors.horizontalCenter: parent.horizontalCenter
           y: glyphGrid.y + Style.space(40)
-          color: Util.alpha(Color.popups.text, 0.5)
-          text: root.glyphList.length === 0 ? "Loading glyphs\u2026"
-              : root.glyphQuery !== "" ? "No glyph matches \u201c" + root.glyphQuery + "\u201d"
+          color: root.dim
+          text: root.picker === "entries" ? "No app matches “" + root.appQuery + "”"
+              : root.glyphList.length === 0 ? "Loading glyphs…"
+              : root.glyphQuery !== "" ? "No glyph matches “" + root.glyphQuery + "”"
               : "Nothing in this category"
         }
       }
