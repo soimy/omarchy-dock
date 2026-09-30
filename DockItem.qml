@@ -12,6 +12,9 @@ Item {
 
   // The plugin root. Repeater fills modelData/index.
   required property var dock
+  // The output this copy of the dock lives on, so hover can say where the
+  // label pill belongs.
+  required property string screenName
   required property var modelData
   required property int index
 
@@ -236,6 +239,7 @@ Item {
       if (cell.dock.dragging) return
       if (hovered) {
         cell.dock.hoveredLabel = cell.label
+        cell.dock.hoveredScreen = cell.screenName
         // Window coordinates for the label pill: map through whatever
         // containers sit between this cell and the window content item,
         // rather than hardcoding the chain of parents.
@@ -243,10 +247,14 @@ Item {
         cell.dock.hoveredCenter = cell.dock.vertical ? c.y : c.x
       } else if (cell.dock.hoveredLabel === cell.label) {
         cell.dock.hoveredLabel = ""
+        cell.dock.hoveredScreen = ""
       }
     }
 
-    Component.onDestruction: if (hovered && cell.dock.hoveredLabel === cell.label) cell.dock.hoveredLabel = ""
+    Component.onDestruction: if (hovered && cell.dock.hoveredLabel === cell.label) {
+      cell.dock.hoveredLabel = ""
+      cell.dock.hoveredScreen = ""
+    }
   }
 
   TapHandler {

@@ -8,8 +8,9 @@
 # need `omarchy restart shell`; nothing here touches that.)
 #
 # Items can be drawn as full-colour app icons or as Nerd Font glyphs; the
-# glyph picker under "Change icon / glyph" carries a curated list, and any
-# glyph can be pasted. Tiles default to the shell's button styling so the
+# glyph picker under "Change icon / glyph" carries every glyph the installed
+# Nerd Font can draw (~10,800, popular ones first), and any glyph can also
+# be pasted. Tiles default to the shell's button styling so the
 # dock matches the rest of the Quickshell kit.
 #
 # gum picks up its colors from the GUM_* variables the session exports from
@@ -147,12 +148,15 @@ list_apps() {
 # kit instead of a row of full-colour logos. Any item can carry one; it wins
 # over `icon` and over the desktop entry's own artwork.
 
-# name<TAB>codepoint. Codepoints are Nerd Fonts v3 (Material Design range),
-# every one checked to render in JetBrainsMono Nerd Font.
+# glyph<TAB>name<TAB>category. Popular ones come first, then the rest by
+# category, which is the order glyphs.json is built in.
 #
 # The settings GUI reads the same list from the plugin's glyphs.json; when
 # that file is present it is the source of truth, so the two pickers can't
-# drift. The table below is the fallback for a stripped install.
+# drift. It holds every icon the installed Nerd Font can draw (~10,800), so
+# the formatting stays inside jq — a bash read loop over that many rows is
+# a visible pause before the picker appears. The table below is the
+# fallback for a stripped install.
 glyphs_json() {
   local candidates=(
     "$HOME/.config/omarchy/plugins/rdf.dock/glyphs.json"
@@ -168,11 +172,8 @@ glyphs_json() {
 glyph_table() {
   local jsonf
   if jsonf=$(glyphs_json); then
-    jq -r '.[] | "\(.name)\t\(.glyph | explode[0] | tostring)"' "$jsonf" 2>/dev/null |
-      while IFS=$'\t' read -r name cp; do
-        [[ -z $cp ]] && continue
-        printf '%s\t%X\n' "$name" "$cp"
-      done
+    jq -r '.[] | select(.glyph != null and .glyph != "")
+             | [.glyph, .name, (.cat // "")] | @tsv' "$jsonf" 2>/dev/null
     return
   fi
 
@@ -228,28 +229,28 @@ glyph_table() {
     "bluetooth|F00AF" \
     "discord|F066F" \
     "ghost|F02A0" \
-  ; do printf '%s\t%s\n' "${e%|*}" "${e##*|}"; done
+  ; do printf '%s\t%s\t\n' "$(glyph_char "${e##*|}")" "${e%|*}"; done
 }
 
 # Turn a hex codepoint into the character itself.
 glyph_char() { printf "\\U$(printf '%08X' "0x$1")"; }
 
 # Prints the chosen glyph, or nothing if the user backed out. `gum filter`
-# shows "<glyph>  <name>" and hands back the codepoint after the tab.
+# shows "<glyph>  <name>  ·<category>" and hands back the glyph itself after
+# the tab. The category rides along in the label so a search for "apps" or
+# "media" narrows the list the same way a name does.
 pick_glyph() {
-  local header=${1:-"Pick a glyph"} line name cp picked
+  local header=${1:-"Pick a glyph"} picked
   picked=$(
-    while IFS=$'\t' read -r name cp; do
-      [[ -z $cp ]] && continue
-      printf '%s  %s\t%s\n' "$(glyph_char "$cp")" "$name" "$cp"
-    done < <(glyph_table) |
-    gum filter --header "$header" --placeholder "Type to search" --label-delimiter=$'\t'
+    glyph_table |
+      awk -F'\t' '{ printf "%s  %s%s\t%s\n", $1, $2, ($3 == "" ? "" : "  ·" $3), $1 }' |
+      gum filter --header "$header" --placeholder "Type to search" --label-delimiter=$'\t'
   ) || return
   # gum's label-delimiter returns just the value when the input has one; be
   # tolerant of either shape.
-  cp=${picked##*$'\t'}
-  [[ -z $cp ]] && return
-  glyph_char "$cp"
+  picked=${picked##*$'\t'}
+  [[ -z $picked ]] && return
+  printf '%s' "$picked"
 }
 
 # Choose how one item is drawn: a glyph from the list, a pasted glyph, an

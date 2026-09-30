@@ -57,19 +57,51 @@ Item {
 
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "rdf.dock"
 
+  // Where this plugin lives on disk. Omarchy <= 4.0.2 stamped __sourceDir
+  // into the manifest; 4.0.3 hands third-party plugins a public copy with
+  // it stripped, so fall back to resolving against this file's own URL.
+  readonly property string pluginDir: {
+    if (manifest && manifest.__sourceDir) return String(manifest.__sourceDir)
+    var url = String(Qt.resolvedUrl("."))
+    if (url.indexOf("file://") === 0) url = url.substring(7)
+    return url.replace(/\/+$/, "")
+  }
+
   // The bundled configurator is the one writer for shell.json. A plain
   // `omarchy plugin add` install has no ~/.local/bin link, so it can't be
   // found via PATH — run the copy that ships next to this file instead.
-  readonly property string configCmd: manifest && manifest.__sourceDir
-    ? Util.shellQuote(String(manifest.__sourceDir) + "/bin/omarchy-dock-config")
+  readonly property string configCmd: pluginDir !== ""
+    ? Util.shellQuote(pluginDir + "/bin/omarchy-dock-config")
     : "omarchy-dock-config"
 
+  // ~/.config/omarchy/shell.json, watched directly. Omarchy 4.0.3 stopped
+  // exposing shell.shellConfig to third-party plugins (they now get a
+  // capability-scoped shell object), so the file itself is the fallback
+  // source of this plugin's settings. The shell rewrites it on every
+  // settings save, so a watch keeps edits live either way.
+  property var fileConfig: ({})
+  FileView {
+    id: userShellConfig
+    path: Quickshell.env("HOME") + "/.config/omarchy/shell.json"
+    watchChanges: true
+    onFileChanged: reload()
+    onLoaded: {
+      try {
+        var parsed = JSON.parse(text())
+        root.fileConfig = Util.isPlainObject(parsed) ? parsed : ({})
+      } catch (e) {
+        console.warn("rdf.dock: shell.json parse failed:", e)
+      }
+    }
+  }
+
   // This plugin's entry in shell.json plugins[]. Reading shell.shellConfig
-  // here is what makes the binding re-evaluate on every shell.json save.
+  // (where the host still offers it) re-evaluates on every save; otherwise
+  // the watched file does.
   readonly property var config: {
-    var list = shell && shell.shellConfig && Array.isArray(shell.shellConfig.plugins)
-      ? shell.shellConfig.plugins
-      : []
+    var source = shell && shell.shellConfig && Array.isArray(shell.shellConfig.plugins)
+      ? shell.shellConfig : root.fileConfig
+    var list = source && Array.isArray(source.plugins) ? source.plugins : []
     for (var i = 0; i < list.length; i++) {
       var entry = list[i]
       if (Util.isPlainObject(entry) && String(entry.id || "") === root.pluginId) return entry
@@ -361,6 +393,7 @@ Item {
     dragPointer = r
     dragIndex = cell.index
     hoveredLabel = ""
+    hoveredScreen = ""
   }
 
   function updateDrag(cell, sceneX, sceneY) {
@@ -722,6 +755,10 @@ Item {
   property bool revealed: false
 
   property string hoveredLabel: ""
+  // Which output the hovered icon is on. The dock windows are Variants
+  // delegates sharing this root, so without it a hover on one monitor
+  // draws the label pill on every visible dock at once.
+  property string hoveredScreen: ""
   // Main-axis centre of the hovered icon, in window coordinates.
   property real hoveredCenter: 0
   readonly property bool wantOpen: active && (hotspotHovers > 0 || dockHovers > 0)
@@ -772,6 +809,7 @@ Item {
     if (revealed) evaluateConditions()
     else {
       hoveredLabel = ""
+      hoveredScreen = ""
       // The popups anchor to the dock; a dock that hides from under them
       // (hideOnLaunch via another item, IPC hide, settings opening) would
       // leave them floating over bare desktop. Hiding closes them, on
@@ -931,11 +969,38 @@ Item {
       return "ok"
     }
 
+    // Drive the glyph picker headlessly: it is behind a hover-and-click
+    // path the synthetic cursor can't reach on a layer surface.
+    function settingsGlyphs(): string {
+      var p = settingsLoader.item
+      if (!p || !p.opened) return "not open"
+      p.openGlyphPicker()
+      return "ok"
+    }
+
+    function settingsGlyphSearch(text: string): string {
+      var p = settingsLoader.item
+      if (!p || p.picker !== "glyphs") return "no glyph picker"
+      p.glyphQuery = String(text).toLowerCase()
+      if (p.glyphQuery !== "" && p.glyphCat === "popular") p.glyphCat = "all"
+      return String(p.glyphView.length)
+    }
+
+    function settingsGlyphCat(id: string): string {
+      var p = settingsLoader.item
+      if (!p || p.picker !== "glyphs") return "no glyph picker"
+      p.glyphCat = String(id)
+      return String(p.glyphView.length)
+    }
+
     function settingsState(): string {
       var p = settingsLoader.item
       if (!p) return "not loaded"
       return JSON.stringify({ opened: p.opened, sel: p.selIndex, dirty: p.dirty,
-                              glyphs: p.glyphList.length, apps: p.appEntries.length })
+                              glyphs: p.glyphList.length, apps: p.appEntries.length,
+                              picker: p.picker, glyphCat: p.glyphCat,
+                              glyphQuery: p.glyphQuery,
+                              glyphShown: p.picker === "glyphs" ? p.glyphView.length : 0 })
     }
 
     function state(): string {
@@ -1429,7 +1494,7 @@ Item {
 
               // The slot itself lives in DockItem.qml; Repeater fills
               // modelData/index, the root comes along explicitly.
-              delegate: DockItem { dock: root }
+              delegate: DockItem { dock: root; screenName: dockWindow.screenName }
             }
           }
         }
@@ -1437,7 +1502,8 @@ Item {
 
       BorderSurface {
         id: tip
-        visible: root.labels && dockWindow.shown && root.hoveredLabel !== "" && !root.dragging
+        visible: root.labels && dockWindow.shown && root.hoveredLabel !== ""
+                 && root.hoveredScreen === dockWindow.screenName && !root.dragging
         height: root.labelHeight
         width: Math.round(tipText.implicitWidth + Style.spacing.xxl * 2)
         // Centred on the hovered icon along the edge, clamped so a label

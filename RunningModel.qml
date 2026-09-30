@@ -12,7 +12,8 @@ import qs.Commons
 //
 //   1. item.appId          explicit override, string or array; wins outright
 //   2. entry.startupClass  the desktop entry's StartupWMClass, when set
-//   3. the desktop id      the well-behaved case (org.gnome.Nautilus)
+//   3. webappClass(exec)   Chromium web apps, derived from the launch URL
+//   4. the desktop id      the well-behaved case (org.gnome.Nautilus)
 //
 // Comparison is case-insensitive and also tries the last dot-segment each
 // way ("nautilus" vs "org.gnome.Nautilus"), because apps are sloppy here.
@@ -70,6 +71,33 @@ Item {
     return a === b || tail(a) === b || a === tail(b)
   }
 
+  // Chromium web apps are the one case both fallbacks miss. Omarchy's
+  // webapp installer writes no StartupWMClass, and the window class looks
+  // nothing like the desktop id ("Scribe" vs "chrome-example.com__-Default"),
+  // so without this every web app reads as "not running" and each dock click
+  // launches another copy. Chromium derives the class from the URL:
+  //
+  //   chrome-<host>_<path>-<profile directory>
+  //
+  // with path's illegal characters folded to "_" — so a bare "/" path
+  // becomes the "__" seen above. The port is *not* part of it (Chromium uses
+  // url.host(), not host:port), which is what makes these near-impossible to
+  // hand-write correctly.
+  function webappClass(exec) {
+    exec = String(exec || "")
+    var url = /--app=(?:"([^"]*)"|'([^']*)'|(\S+))/.exec(exec)
+      || /omarchy-launch-webapp\s+(?:-\S*\s+)*(?:"([^"]*)"|'([^']*)'|(\S+))/.exec(exec)
+    if (!url) return ""
+    var parts = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^\/?#]+)([^?#]*)/.exec(url[1] || url[2] || url[3] || "")
+    if (!parts) return ""
+    var host = parts[1].replace(/^[^@]*@/, "").replace(/:\d+$/, "")
+    if (!host) return ""
+    var path = (parts[2] || "/").replace(/[\/\\:*?"<>|]/g, "_")
+    var profile = /--profile-directory=(?:"([^"]*)"|'([^']*)'|(\S+))/.exec(exec)
+    var dir = profile ? (profile[1] || profile[2] || profile[3]) : "Default"
+    return "chrome-" + host + "_" + path + "-" + dir
+  }
+
   function matchKeys(item) {
     if (!Util.isPlainObject(item) || item.spacer === true || item.__divider === true) return []
     if (item.appId !== undefined) {
@@ -81,6 +109,10 @@ Item {
     var out = []
     var entry = dock.desktopEntry(item)
     if (entry && entry.startupClass) out.push(String(entry.startupClass))
+    if (entry && entry.execString) {
+      var web = webappClass(entry.execString)
+      if (web) out.push(web)
+    }
     if (item.desktop) out.push(String(item.desktop).replace(/\.desktop$/, ""))
     return out
   }

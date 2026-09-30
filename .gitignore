@@ -4,3 +4,4 @@
 # local dev files, not shipped
 CLAUDE.md
 docs/
+scripts/.glyphnames.cache.json
