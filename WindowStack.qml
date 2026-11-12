@@ -5,8 +5,8 @@ import qs.Commons
 import qs.Ui
 
 // The window stack: hover-dwell on a running icon opens a vertical run of
-// live previews above the tile — one ScreencopyView per window, streaming
-// only while the stack is open, with the window title beneath. Click
+// window cards above the tile, with the window title beneath. Live capture
+// is disabled as a workaround for Hyprland #16127 (see below). Click
 // focuses that window; the corner badge closes it. `hoverActivate` makes
 // row-hover focus it macOS-style; it defaults off, because hover-focus
 // steals focus from wherever you were typing.
@@ -220,33 +220,19 @@ PopupWindow {
             border.color: Util.alpha(Color.popups.text, 0.12)
             clip: true
 
-            ScreencopyView {
-              anchors.fill: parent
-              anchors.margins: 1
-              captureSource: winRow.modelData
-              // Streaming costs a copy per frame per window; only pay it
-              // while the stack is actually on screen (fade-out included,
-              // so the shot doesn't blank mid-exit).
-              live: stack.visible
-              // The first frame lands a beat after the card does. Hold the
-              // placeholder frame until then and fade the shot over it,
-              // rather than letting it snap in.
-              opacity: hasContent ? 1 : 0
-              Behavior on opacity {
-                NumberAnimation { duration: 160; easing.type: Easing.OutCubic }
-              }
-
-              // A full window squeezed into a 230px shot is a brutal
-              // downscale, and the view samples it once — text turns to
-              // shimmer. Render through a layer a few times the shot's size
-              // (capped at the source) with mipmaps, so the final step is a
-              // filtered downsample rather than a point-sampled one.
-              layer.enabled: true
-              layer.smooth: true
-              layer.mipmap: true
-              layer.textureSize: Qt.size(
-                Math.max(1, Math.min(Math.round(width * 4), sourceSize.width > 0 ? sourceSize.width : Math.round(width * 4))),
-                Math.max(1, Math.min(Math.round(height * 4), sourceSize.height > 0 ? sourceSize.height : Math.round(height * 4))))
+            // Hyprland 0.56.2 can dereference a null monitor while creating
+            // a toplevel capture during DisplayPort sleep/hotplug (#16127).
+            // Keep window selection, but issue no capture requests until a
+            // compositor fix is installed. Backup: ~/.local/state/omarchy/wake-recovery/backups
+            Text {
+              anchors.centerIn: parent
+              width: parent.width - 16
+              text: String(winRow.modelData.appId || "Window")
+              color: Color.popups.text
+              font.family: Style.font.resolvedFamily
+              font.pixelSize: Style.font.bodySmall
+              horizontalAlignment: Text.AlignHCenter
+              elide: Text.ElideRight
             }
           }
 
